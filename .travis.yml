@@ -2,7 +2,7 @@ sudo: required
 services:
 - docker
 script:
-- sed -i "/\b\(oom_kill_disable)\b/d" docker-compose.yml
+- sed -i '/oom_kill_disable/d' docker-compose.yml
 - echo 'Europe/Berlin' | MAILCOW_HOSTNAME=build.mailcow ./generate_config.sh
 - docker-compose build
 branches:
