@@ -13,8 +13,12 @@ log_f() {
   elif [[ ${2} != "redis_only" ]]; then
     echo "$(date) - ${1}"
   fi
-  redis-cli -h redis LPUSH ACME_LOG "{\"time\":\"$(date +%s)\",\"message\":\"$(printf '%s' "${1}" | \
-    tr '%&;$"_[]{}-\r\n' ' ')\"}" > /dev/null
+  if [[ ${3} == "b64" ]]; then
+    redis-cli -h redis LPUSH ACME_LOG "{\"time\":\"$(date +%s)\",\"message\":\"base64,$(printf '%s' "${1}")\"}" > /dev/null
+  else
+    redis-cli -h redis LPUSH ACME_LOG "{\"time\":\"$(date +%s)\",\"message\":\"$(printf '%s' "${1}" | \
+      tr '%&;$"_[]{}-\r\n' ' ')\"}" > /dev/null
+  fi
 }
 
 if [[ "${SKIP_LETS_ENCRYPT}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
@@ -37,7 +41,7 @@ mkdir -p ${ACME_BASE}/acme/private
 restart_containers(){
   for container in $*; do
     log_f "Restarting ${container}..." no_nl
-    C_REST_OUT=$(curl -X POST http://dockerapi:8080/containers/${container}/restart | jq -r '.msg')
+    C_REST_OUT=$(curl -X POST --insecure https://dockerapi/containers/${container}/restart | jq -r '.msg')
     log_f "${C_REST_OUT}" no_date
   done
 }
@@ -66,12 +70,8 @@ get_ipv4(){
   local IPV4=
   local IPV4_SRCS=
   local TRY=
-  IPV4_SRCS[0]="api.ipify.org"
-  IPV4_SRCS[1]="ifconfig.co"-
-  IPV4_SRCS[2]="icanhazip.com"
-  IPV4_SRCS[3]="v4.ident.me"
-  IPV4_SRCS[4]="ipecho.net/plain"
-  IPV4_SRCS[5]="ip4.mailcow.email"
+  IPV4_SRCS[0]="ip4.mailcow.email"
+  IPV4_SRCS[1]="ip4.korves.net"
   until [[ ! -z ${IPV4} ]] || [[ ${TRY} -ge 10 ]]; do
     IPV4=$(curl --connect-timeout 3 -m 10 -L4s ${IPV4_SRCS[$RANDOM % ${#IPV4_SRCS[@]} ]} | grep -E "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$")
     [[ ! -z ${TRY} ]] && sleep 1
@@ -84,10 +84,8 @@ get_ipv6(){
   local IPV6=
   local IPV6_SRCS=
   local TRY=
-  IPV6_SRCS[0]="ifconfig.co"
-  IPV6_SRCS[1]="icanhazip.com"
-  IPV6_SRCS[2]="v6.ident.me"
-  IPV6_SRCS[3]="ip6.mailcow.email"
+  IPV6_SRCS[0]="ip6.korves.net"
+  IPV6_SRCS[1]="ip6.mailcow.email"
   until [[ ! -z ${IPV6} ]] || [[ ${TRY} -ge 10 ]]; do
     IPV6=$(curl --connect-timeout 3 -m 10 -L6s ${IPV6_SRCS[$RANDOM % ${#IPV6_SRCS[@]} ]} | grep "^\([0-9a-fA-F]\{0,4\}:\)\{1,7\}[0-9a-fA-F]\{0,4\}$")
     [[ ! -z ${TRY} ]] && sleep 1
@@ -131,7 +129,7 @@ else
 fi
 
 log_f "Waiting for database... "
-while ! mysqladmin ping --host mysql -u${DBUSER} -p${DBPASS} --silent; do
+while ! mysqladmin status --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} --silent; do
   sleep 2
 done
 log_f "Initializing, please wait... "
@@ -153,20 +151,33 @@ while true; do
   IPV6=$(get_ipv6)
   log_f "OK" no_date
 
+  # Hard-fail on CAA errors for MAILCOW_HOSTNAME
+  MH_PARENT_DOMAIN=$(echo ${MAILCOW_HOSTNAME} | cut -d. -f2-)
+  MH_CAAS=( $(dig CAA ${MH_PARENT_DOMAIN} +short | sed -n 's/\d issue "\(.*\)"/\1/p') )
+  if [[ ! -z ${MH_CAAS} ]]; then
+    if [[ ${MH_CAAS[@]} =~ "letsencrypt.org" ]]; then
+      echo "Validated CAA for parent domain ${MH_PARENT_DOMAIN}"
+    else
+      echo "Skipping ACME validation: Lets Encrypt disallowed for ${MAILCOW_HOSTNAME} by CAA record, retrying in 1h..."
+      sleep 1h
+      exec $(readlink -f "$0")
+    fi
+  fi
+
   # Container ids may have changed
-  CONTAINERS_RESTART=($(curl --silent http://dockerapi:8080/containers/json | jq -r '.[] | {name: .Config.Labels["com.docker.compose.service"], id: .Id}' | jq -rc 'select( .name | tostring | contains("nginx-mailcow") or contains("postfix-mailcow") or contains("dovecot-mailcow")) | .id' | tr "\n" " "))
+  CONTAINERS_RESTART=($(curl --silent --insecure https://dockerapi/containers/json | jq -r '.[] | {name: .Config.Labels["com.docker.compose.service"], id: .Id}' | jq -rc 'select( .name | tostring | contains("nginx-mailcow") or contains("postfix-mailcow") or contains("dovecot-mailcow")) | .id' | tr "\n" " "))
 
   log_f "Waiting for domain table... " no_nl
   while [[ -z ${DOMAIN_TABLE} ]]; do
     curl --silent http://nginx/ >/dev/null 2>&1
-    DOMAIN_TABLE=$(mysql -h mysql-mailcow -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SHOW TABLES LIKE 'domain'" -Bs)
+    DOMAIN_TABLE=$(mysql --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SHOW TABLES LIKE 'domain'" -Bs)
     [[ -z ${DOMAIN_TABLE} ]] && sleep 10
   done
   log_f "OK" no_date
 
   while read domains; do
     SQL_DOMAIN_ARR+=("${domains}")
-  done < <(mysql -h mysql-mailcow -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT domain FROM domain WHERE backupmx=0 UNION SELECT alias_domain FROM alias_domain" -Bs)
+  done < <(mysql --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT domain FROM domain WHERE backupmx=0 UNION SELECT alias_domain FROM alias_domain" -Bs)
 
   for SQL_DOMAIN in "${SQL_DOMAIN_ARR[@]}"; do
     A_CONFIG=$(dig A autoconfig.${SQL_DOMAIN} +short | tail -n 1)
@@ -249,6 +260,17 @@ while true; do
   fi
 
   for SAN in "${ADDITIONAL_SAN_ARR[@]}"; do
+    # Skip on CAA errors for SAN
+    SAN_PARENT_DOMAIN=$(echo ${SAN} | cut -d. -f2-)
+    SAN_CAAS=( $(dig CAA ${SAN_PARENT_DOMAIN} +short | sed -n 's/\d issue "\(.*\)"/\1/p') )
+    if [[ ! -z ${SAN_CAAS} ]]; then
+      if [[ ${SAN_CAAS[@]} =~ "letsencrypt.org" ]]; then
+        echo "Validated CAA for parent domain ${SAN_PARENT_DOMAIN} of ${SAN}"
+      else
+        echo "Skipping ACME validation for ${SAN}: Lets Encrypt disallowed for ${SAN} by CAA record"
+        continue
+      fi
+    fi
     if [[ ${SAN} == ${MAILCOW_HOSTNAME} ]]; then
       continue
     fi
@@ -306,10 +328,10 @@ while true; do
     -k ${ACME_BASE}/acme/private/privkey.pem \
     -c ${ACME_BASE}/acme \
     ${ALL_VALIDATED[*]} 2>&1 | tee /dev/fd/5)
-
   case "$?" in
     0) # new certs
-      log_f "${ACME_RESPONSE}" redis_only
+      ACME_RESPONSE_B64=$(echo ${ACME_RESPONSE} | openssl enc -e -A -base64)
+      log_f "${ACME_RESPONSE_B64}" redis_only b64
       # cp the new certificates and keys
       cp ${ACME_BASE}/acme/fullchain.pem ${ACME_BASE}/cert.pem
       cp ${ACME_BASE}/acme/private/privkey.pem ${ACME_BASE}/key.pem
@@ -323,7 +345,8 @@ while true; do
       restart_containers ${CONTAINERS_RESTART[*]}
       ;;
     1) # failure
-      log_f "${ACME_RESPONSE}" redis_only
+      ACME_RESPONSE_B64=$(echo ${ACME_RESPONSE} | openssl enc -e -A -base64)
+      log_f "${ACME_RESPONSE_B64}" redis_only b64
       if [[ $ACME_RESPONSE =~ "No registration exists" ]]; then
         log_f "Registration keys are invalid, deleting old keys and restarting..."
         rm ${ACME_BASE}/acme/private/account.key
@@ -352,7 +375,8 @@ while true; do
       exec $(readlink -f "$0")
       ;;
     2) # no change
-      log_f "${ACME_RESPONSE}" redis_only
+      ACME_RESPONSE_B64=$(echo ${ACME_RESPONSE} | openssl enc -e -A -base64)
+      log_f "${ACME_RESPONSE_B64}" redis_only b64
       if ! diff ${ACME_BASE}/acme/fullchain.pem ${ACME_BASE}/cert.pem; then
         log_f "Certificate was not changed, but active certificate does not match the verified certificate, fixing and restarting containers..."
         cp ${ACME_BASE}/acme/fullchain.pem ${ACME_BASE}/cert.pem
@@ -369,7 +393,8 @@ while true; do
       [[ ${TRIGGER_RESTART} == 1 ]] && restart_containers ${CONTAINERS_RESTART[*]}
       ;;
     *) # unspecified
-      log_f "${ACME_RESPONSE}" redis_only
+      ACME_RESPONSE_B64=$(echo ${ACME_RESPONSE} | openssl enc -e -A -base64)
+      log_f "${ACME_RESPONSE_B64}" redis_only b64
       if [[ -f ${ACME_BASE}/acme/private/${DATE}.bak/fullchain.pem ]] && [[ -f ${ACME_BASE}/acme/private/${DATE}.bak/privkey.pem ]]; then
         log_f "Error requesting certificate, restoring previous certificate from backup and restarting containers...."
         cp ${ACME_BASE}/acme/private/${DATE}.bak/fullchain.pem ${ACME_BASE}/cert.pem

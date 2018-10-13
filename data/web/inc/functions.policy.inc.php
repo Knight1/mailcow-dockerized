@@ -6,12 +6,20 @@ function policy($_action, $_scope, $_data = null) {
 	$_data_log = $_data;
   switch ($_action) {
     case 'add':
+      if (!isset($_SESSION['acl']['spam_policy']) || $_SESSION['acl']['spam_policy'] != "1" ) {
+        $_SESSION['return'][] = array(
+          'type' => 'danger',
+          'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
+          'msg' => 'access_denied'
+        );
+        return false;
+      }
       switch ($_scope) {
         case 'domain':
           $object = $_data['domain'];
           if (is_valid_domain_name($object)) {
             if (!hasDomainAccess($_SESSION['mailcow_cc_username'], $_SESSION['mailcow_cc_role'], $object)) {
-              $_SESSION['return'] = array(
+              $_SESSION['return'][] = array(
                 'type' => 'danger',
                 'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
                 'msg' => 'access_denied'
@@ -21,7 +29,7 @@ function policy($_action, $_scope, $_data = null) {
             $object = idn_to_ascii(strtolower(trim($object)));
           }
           else {
-            $_SESSION['return'] = array(
+            $_SESSION['return'][] = array(
               'type' => 'danger',
               'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
               'msg' => 'access_denied'
@@ -36,7 +44,7 @@ function policy($_action, $_scope, $_data = null) {
           }
           $object_from = preg_replace('/\.+/', '.', rtrim(preg_replace("/\.\*/", "*", trim(strtolower($_data['object_from']))), '.'));
           if (!ctype_alnum(str_replace(array('@', '_', '.', '-', '*'), '', $object_from))) {
-            $_SESSION['return'] = array(
+            $_SESSION['return'][] = array(
               'type' => 'danger',
               'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
               'msg' => 'policy_list_from_invalid'
@@ -44,55 +52,37 @@ function policy($_action, $_scope, $_data = null) {
             return false;
           }
           if ($object_list != "blacklist_from" && $object_list != "whitelist_from") {
-            $_SESSION['return'] = array(
+            $_SESSION['return'][] = array(
               'type' => 'danger',
               'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
               'msg' => 'access_denied'
             );
             return false;
           }
-          try {
-            $stmt = $pdo->prepare("SELECT `object` FROM `filterconf`
-              WHERE (`option` = 'whitelist_from'  OR `option` = 'blacklist_from')
-                AND `object` = :object
-                AND `value` = :object_from");
-            $stmt->execute(array(':object' => $object, ':object_from' => $object_from));
-            $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
-            if ($num_results != 0) {
-              $_SESSION['return'] = array(
-                'type' => 'danger',
-                'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-                'msg' => 'policy_list_from_exists'
-              );
-              return false;
-            }
-          }
-          catch(PDOException $e) {
-            $_SESSION['return'] = array(
+          $stmt = $pdo->prepare("SELECT `object` FROM `filterconf`
+            WHERE (`option` = 'whitelist_from'  OR `option` = 'blacklist_from')
+              AND `object` = :object
+              AND `value` = :object_from");
+          $stmt->execute(array(':object' => $object, ':object_from' => $object_from));
+          $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
+          if ($num_results != 0) {
+            $_SESSION['return'][] = array(
               'type' => 'danger',
               'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-              'msg' => array('mysql_error', $e)
+              'msg' => 'policy_list_from_exists'
             );
             return false;
           }
-          try {
-            $stmt = $pdo->prepare("INSERT INTO `filterconf` (`object`, `option` ,`value`)
-              VALUES (:object, :object_list, :object_from)");
-            $stmt->execute(array(
-              ':object' => $object,
-              ':object_list' => $object_list,
-              ':object_from' => $object_from
-            ));
-          }
-          catch (PDOException $e) {
-            $_SESSION['return'] = array(
-              'type' => 'danger',
-              'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-              'msg' => array('mysql_error', $e)
-            );
-            return false;
-          }
-          $_SESSION['return'] = array(
+
+          $stmt = $pdo->prepare("INSERT INTO `filterconf` (`object`, `option` ,`value`)
+            VALUES (:object, :object_list, :object_from)");
+          $stmt->execute(array(
+            ':object' => $object,
+            ':object_list' => $object_list,
+            ':object_from' => $object_from
+          ));
+
+          $_SESSION['return'][] = array(
             'type' => 'success',
             'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
             'msg' => array('domain_modified', $object)
@@ -101,15 +91,7 @@ function policy($_action, $_scope, $_data = null) {
         case 'mailbox':
           $object = $_data['username'];
           if (!hasMailboxObjectAccess($_SESSION['mailcow_cc_username'], $_SESSION['mailcow_cc_role'], $object)) {
-            $_SESSION['return'] = array(
-              'type' => 'danger',
-              'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-              'msg' => 'access_denied'
-            );
-            return false;
-          }
-          if (!isset($_SESSION['acl']['spam_policy']) || $_SESSION['acl']['spam_policy'] != "1" ) {
-            $_SESSION['return'] = array(
+            $_SESSION['return'][] = array(
               'type' => 'danger',
               'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
               'msg' => 'access_denied'
@@ -124,7 +106,7 @@ function policy($_action, $_scope, $_data = null) {
           }
           $object_from = preg_replace('/\.+/', '.', rtrim(preg_replace("/\.\*/", "*", trim(strtolower($_data['object_from']))), '.'));
           if (!ctype_alnum(str_replace(array('@', '_', '.', '-', '*'), '', $object_from))) {
-            $_SESSION['return'] = array(
+            $_SESSION['return'][] = array(
               'type' => 'danger',
               'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
               'msg' => 'policy_list_from_invalid'
@@ -132,55 +114,35 @@ function policy($_action, $_scope, $_data = null) {
             return false;
           }
           if ($object_list != "blacklist_from" && $object_list != "whitelist_from") {
-            $_SESSION['return'] = array(
+            $_SESSION['return'][] = array(
               'type' => 'danger',
               'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
               'msg' => 'access_denied'
             );
             return false;
           }
-          try {
-            $stmt = $pdo->prepare("SELECT `object` FROM `filterconf`
-              WHERE (`option` = 'whitelist_from'  OR `option` = 'blacklist_from')
-                AND `object` = :object
-                AND `value` = :object_from");
-            $stmt->execute(array(':object' => $object, ':object_from' => $object_from));
-            $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
-            if ($num_results != 0) {
-              $_SESSION['return'] = array(
-                'type' => 'danger',
-                'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-                'msg' => 'policy_list_from_exists'
-              );
-              return false;
-            }
-          }
-          catch(PDOException $e) {
-            $_SESSION['return'] = array(
+          $stmt = $pdo->prepare("SELECT `object` FROM `filterconf`
+            WHERE (`option` = 'whitelist_from'  OR `option` = 'blacklist_from')
+              AND `object` = :object
+              AND `value` = :object_from");
+          $stmt->execute(array(':object' => $object, ':object_from' => $object_from));
+          $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
+          if ($num_results != 0) {
+            $_SESSION['return'][] = array(
               'type' => 'danger',
               'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-              'msg' => array('mysql_error', $e)
+              'msg' => 'policy_list_from_exists'
             );
             return false;
           }
-          try {
-            $stmt = $pdo->prepare("INSERT INTO `filterconf` (`object`, `option` ,`value`)
-              VALUES (:object, :object_list, :object_from)");
-            $stmt->execute(array(
-              ':object' => $object,
-              ':object_list' => $object_list,
-              ':object_from' => $object_from
-            ));
-          }
-          catch (PDOException $e) {
-            $_SESSION['return'] = array(
-              'type' => 'danger',
-              'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-              'msg' => array('mysql_error', $e)
-            );
-            return false;
-          }
-          $_SESSION['return'] = array(
+          $stmt = $pdo->prepare("INSERT INTO `filterconf` (`object`, `option` ,`value`)
+            VALUES (:object, :object_list, :object_from)");
+          $stmt->execute(array(
+            ':object' => $object,
+            ':object_list' => $object_list,
+            ':object_from' => $object_from
+          ));
+          $_SESSION['return'][] = array(
             'type' => 'success',
             'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
             'msg' => array('mailbox_modified', $object)
@@ -189,48 +151,47 @@ function policy($_action, $_scope, $_data = null) {
       }
     break;
     case 'delete':
+      if (!isset($_SESSION['acl']['spam_policy']) || $_SESSION['acl']['spam_policy'] != "1" ) {
+        $_SESSION['return'][] = array(
+          'type' => 'danger',
+          'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
+          'msg' => 'access_denied'
+        );
+        return false;
+      }
       switch ($_scope) {
         case 'domain':
           (array)$prefids = $_data['prefid'];
           foreach ($prefids as $prefid) {
             if (!is_numeric($prefid)) {
-              $_SESSION['return'] = array(
+              $_SESSION['return'][] = array(
                 'type' => 'danger',
                 'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
                 'msg' => 'access_denied'
               );
-              return false;
+              continue;
             }
-            try {
-              $stmt = $pdo->prepare("SELECT `object` FROM `filterconf` WHERE `prefid` = :prefid");
-              $stmt->execute(array(':prefid' => $prefid));
-              $object = $stmt->fetch(PDO::FETCH_ASSOC)['object'];
-            }
-            catch(PDOException $e) {
-              $_SESSION['return'] = array(
-                'type' => 'danger',
-                'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-                'msg' => array('mysql_error', $e)
-              );
-            }
+            $stmt = $pdo->prepare("SELECT `object` FROM `filterconf` WHERE `prefid` = :prefid");
+            $stmt->execute(array(':prefid' => $prefid));
+            $object = $stmt->fetch(PDO::FETCH_ASSOC)['object'];
             if (is_valid_domain_name($object)) {
               if (!hasDomainAccess($_SESSION['mailcow_cc_username'], $_SESSION['mailcow_cc_role'], $object)) {
-                $_SESSION['return'] = array(
+                $_SESSION['return'][] = array(
                   'type' => 'danger',
                   'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
                   'msg' => 'access_denied'
                 );
-                return false;
+                continue;
               }
               $object = idn_to_ascii(strtolower(trim($object)));
             }
             else {
-              $_SESSION['return'] = array(
+              $_SESSION['return'][] = array(
                 'type' => 'danger',
                 'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
                 'msg' => 'access_denied'
               );
-              return false;
+              continue;
             }
             try {
               $stmt = $pdo->prepare("DELETE FROM `filterconf` WHERE `object` = :object AND `prefid` = :prefid");
@@ -240,19 +201,19 @@ function policy($_action, $_scope, $_data = null) {
               ));
             }
             catch (PDOException $e) {
-              $_SESSION['return'] = array(
+              $_SESSION['return'][] = array(
                 'type' => 'danger',
                 'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
                 'msg' => array('mysql_error', $e)
               );
-              return false;
+              continue;
             }
+            $_SESSION['return'][] = array(
+              'type' => 'success',
+              'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
+              'msg' => array('item_deleted',$prefid)
+            );
           }
-          $_SESSION['return'] = array(
-            'type' => 'success',
-            'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-            'msg' => array('items_deleted', implode(', ', $prefids))
-          );
         break;
         case 'mailbox':
           if (!is_array($_data['prefid'])) {
@@ -262,42 +223,25 @@ function policy($_action, $_scope, $_data = null) {
           else {
             $prefids = $_data['prefid'];
           }
-          if (!isset($_SESSION['acl']['spam_policy']) || $_SESSION['acl']['spam_policy'] != "1" ) {
-            $_SESSION['return'] = array(
-              'type' => 'danger',
-              'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-              'msg' => 'access_denied'
-            );
-            return false;
-          }
           foreach ($prefids as $prefid) {
             if (!is_numeric($prefid)) {
-              $_SESSION['return'] = array(
+              $_SESSION['return'][] = array(
                 'type' => 'danger',
                 'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
                 'msg' => 'access_denied'
               );
-              return false;
+              continue;
             }
-            try {
-              $stmt = $pdo->prepare("SELECT `object` FROM `filterconf` WHERE `prefid` = :prefid");
-              $stmt->execute(array(':prefid' => $prefid));
-              $object = $stmt->fetch(PDO::FETCH_ASSOC)['object'];
-            }
-            catch(PDOException $e) {
-              $_SESSION['return'] = array(
-                'type' => 'danger',
-                'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-                'msg' => array('mysql_error', $e)
-              );
-            }
+            $stmt = $pdo->prepare("SELECT `object` FROM `filterconf` WHERE `prefid` = :prefid");
+            $stmt->execute(array(':prefid' => $prefid));
+            $object = $stmt->fetch(PDO::FETCH_ASSOC)['object'];
             if (!hasMailboxObjectAccess($_SESSION['mailcow_cc_username'], $_SESSION['mailcow_cc_role'], $object)) {
-              $_SESSION['return'] = array(
+              $_SESSION['return'][] = array(
                 'type' => 'danger',
                 'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
                 'msg' => 'access_denied'
               );
-              return false;
+              continue;
             }
             try {
               $stmt = $pdo->prepare("DELETE FROM `filterconf` WHERE `object` = :object AND `prefid` = :prefid");
@@ -307,19 +251,19 @@ function policy($_action, $_scope, $_data = null) {
               ));
             }
             catch (PDOException $e) {
-              $_SESSION['return'] = array(
+              $_SESSION['return'][] = array(
                 'type' => 'danger',
                 'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
                 'msg' => array('mysql_error', $e)
               );
-              return false;
+              continue;
             }
+            $_SESSION['return'][] = array(
+              'type' => 'success',
+              'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
+              'msg' => array('items_deleted', implode(', ', $prefids))
+            );
           }
-          $_SESSION['return'] = array(
-            'type' => 'success',
-            'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-            'msg' => array('items_deleted', implode(', ', $prefids))
-          );
         break;
       }
     break;
@@ -335,23 +279,16 @@ function policy($_action, $_scope, $_data = null) {
             }
             $_data = idn_to_ascii(strtolower(trim($_data)));
           }
-          try {
-            // WHITELIST
-            $stmt = $pdo->prepare("SELECT `object`, `value`, `prefid` FROM `filterconf` WHERE `option`='whitelist_from' AND (`object` LIKE :object_mail OR `object` = :object_domain)");
-            $stmt->execute(array(':object_mail' => '%@' . $_data, ':object_domain' => $_data));
-            $rows['whitelist'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            // BLACKLIST
-            $stmt = $pdo->prepare("SELECT `object`, `value`, `prefid` FROM `filterconf` WHERE `option`='blacklist_from' AND (`object` LIKE :object_mail OR `object` = :object_domain)");
-            $stmt->execute(array(':object_mail' => '%@' . $_data, ':object_domain' => $_data));
-            $rows['blacklist'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-          }
-          catch(PDOException $e) {
-            $_SESSION['return'] = array(
-              'type' => 'danger',
-              'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-              'msg' => array('mysql_error', $e)
-            );
-          }
+
+          // WHITELIST
+          $stmt = $pdo->prepare("SELECT `object`, `value`, `prefid` FROM `filterconf` WHERE `option`='whitelist_from' AND (`object` LIKE :object_mail OR `object` = :object_domain)");
+          $stmt->execute(array(':object_mail' => '%@' . $_data, ':object_domain' => $_data));
+          $rows['whitelist'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+          // BLACKLIST
+          $stmt = $pdo->prepare("SELECT `object`, `value`, `prefid` FROM `filterconf` WHERE `option`='blacklist_from' AND (`object` LIKE :object_mail OR `object` = :object_domain)");
+          $stmt->execute(array(':object_mail' => '%@' . $_data, ':object_domain' => $_data));
+          $rows['blacklist'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
           return $rows;
         break;
         case 'mailbox':
@@ -367,23 +304,14 @@ function policy($_action, $_scope, $_data = null) {
           if (empty($domain)) {
             return false;
           }
-          try {
-            // WHITELIST
-            $stmt = $pdo->prepare("SELECT `object`, `value`, `prefid` FROM `filterconf` WHERE `option`='whitelist_from' AND (`object` = :username OR `object` = :domain)");
-            $stmt->execute(array(':username' => $_data, ':domain' => $domain));
-            $rows['whitelist'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            // BLACKLIST
-            $stmt = $pdo->prepare("SELECT `object`, `value`, `prefid` FROM `filterconf` WHERE `option`='blacklist_from' AND (`object` = :username OR `object` = :domain)");
-            $stmt->execute(array(':username' => $_data, ':domain' => $domain));
-            $rows['blacklist'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-          }
-          catch(PDOException $e) {
-            $_SESSION['return'] = array(
-              'type' => 'danger',
-              'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-              'msg' => array('mysql_error', $e)
-            );
-          }
+          // WHITELIST
+          $stmt = $pdo->prepare("SELECT `object`, `value`, `prefid` FROM `filterconf` WHERE `option`='whitelist_from' AND (`object` = :username OR `object` = :domain)");
+          $stmt->execute(array(':username' => $_data, ':domain' => $domain));
+          $rows['whitelist'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+          // BLACKLIST
+          $stmt = $pdo->prepare("SELECT `object`, `value`, `prefid` FROM `filterconf` WHERE `option`='blacklist_from' AND (`object` = :username OR `object` = :domain)");
+          $stmt->execute(array(':username' => $_data, ':domain' => $domain));
+          $rows['blacklist'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
           return $rows;
         break;
       }

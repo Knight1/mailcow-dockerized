@@ -167,10 +167,11 @@ jQuery(function($){
       "columns": [
         {"name":"time","formatter":function unix_time_format(tm) { var date = new Date(tm ? tm * 1000 : 0); return date.toLocaleString();},"title":lang.time,"style":{"width":"170px"}},
         {"name":"type","title":"Type"},
+        {"name":"task","title":"Task"},
         {"name":"user","title":"User"},
         {"name":"role","title":"Role"},
         {"name":"remote","title":"IP"},
-        {"name":"msg","title":lang.message},
+        {"name":"msg","title":lang.message,"style":{"word-break":"break-all"}},
         {"name":"call","title":"Call","breakpoints": "all"},
       ],
       "rows": $.ajax({
@@ -506,12 +507,19 @@ jQuery(function($){
       $.each(data, function (i, item) {
         if (item === null) { return true; }
         item.user = escapeHtml(item.user);
+        item.task = '<code>' + item.task + '</code>';
         item.type = '<span class="label label-' + item.type + '">' + item.type + '</span>';
       });
     } else if (table == 'general_syslog') {
       $.each(data, function (i, item) {
         if (item === null) { return true; }
-        item.message = escapeHtml(item.message);
+        if (item.message.match("^base64,")) {
+          item.message = atob(item.message.slice(7));
+          item.message = item.message.replace(/(?!^)acme-client:/g, '<br>acme-client:')
+          item.message = item.message.replace(/acme-client:/g, '<b>acme-client:</b>')
+        } else {
+          item.message = escapeHtml(item.message);
+        }
         var danger_class = ["emerg", "alert", "crit", "err"];
         var warning_class = ["warning", "warn"];
         var info_class = ["notice", "info", "debug"];

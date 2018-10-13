@@ -1,8 +1,8 @@
 <?php
-require_once "inc/prerequisites.inc.php";
+require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/prerequisites.inc.php';
 
 if (isset($_SESSION['mailcow_cc_role']) && $_SESSION['mailcow_cc_role'] == "admin") {
-require_once "inc/header.inc.php";
+require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/header.inc.php';
 $_SESSION['return_to'] = $_SERVER['REQUEST_URI'];
 
 ?>
@@ -288,8 +288,8 @@ echo "var log_pagination_size = '". $LOG_PAGINATION_SIZE . "';\n";
 
 ?>
 </script>
-<script src="js/footable.min.js"></script>
-<script src="js/debug.js"></script>
+<script src="/js/footable.min.js"></script>
+<script src="/js/debug.js"></script>
 <?php
 require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/footer.inc.php';
 }
