@@ -104,6 +104,12 @@ TZ=${MAILCOW_TZ}
 # Fixed project name
 COMPOSE_PROJECT_NAME=mailcowdockerized
 
+# Garbage collector cleanup
+# Deleted domains and mailboxes are moved to /var/vmail/_garbage/timestamp_sanitizedstring
+# How long should objects remain in the garbage until they are being deleted? (value in minutes)
+# Check interval is hourly
+MAILDIR_GC_TIME=1440
+
 # Additional SAN for the certificate
 ADDITIONAL_SAN=
 
@@ -144,6 +150,7 @@ SYSCTL_IPV6_DISABLED=0
 
 # Create or override API key for web uI
 # You _must_ define API_ALLOW_FROM, which is a comma separated list of IPs
+# API_KEY allowed chars: a-z, A-Z, 0-9, -
 #API_KEY=
 #API_ALLOW_FROM=127.0.0.1,1.2.3.4
 

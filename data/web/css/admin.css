@@ -65,9 +65,9 @@ body.modal-open {
   font-size:9pt;
   background:transparent;
 }
-.bootstrap-select {
-  width: auto!important;
-}
 .table-condensed .input-sm {
   width: 100%!important;  
+}
+.table-condensed > thead > tr > th, .table-condensed > tbody > tr > th, .table-condensed > tfoot > tr > th, .table-condensed > thead > tr > td, .table-condensed > tbody > tr > td, .table-condensed > tfoot > tr > td {
+  padding: 3px;
 }
