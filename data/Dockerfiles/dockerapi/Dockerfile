@@ -1,10 +1,18 @@
-FROM alpine:3.8
+FROM alpine:3.13
+
 LABEL maintainer "Andre Peters <andre.peters@servercow.de>"
 
-RUN apk add -U --no-cache python2 python-dev py-pip gcc musl-dev tzdata openssl-dev libffi-dev \
-  && pip2 install --upgrade docker==3.0.1 flask flask-restful pyOpenSSL \
-  && apk del python-dev py2-pip gcc
+WORKDIR /app
 
-COPY server.py /
+RUN apk add --update --no-cache python3 \
+  py3-pip \
+  openssl \
+  tzdata \
+&& pip3 install --upgrade pip \
+  docker \
+  flask \
+  flask-restful
 
-CMD ["python2", "-u", "/server.py"]
+COPY dockerapi.py /app/
+
+CMD ["python3", "-u", "/app/dockerapi.py"]

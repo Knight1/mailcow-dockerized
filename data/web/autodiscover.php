@@ -9,7 +9,17 @@ $autodiscover_config = array_merge($default_autodiscover_config, $autodiscover_c
 
 // Redis
 $redis = new Redis();
-$redis->connect('redis-mailcow', 6379);
+try {
+  if (!empty(getenv('REDIS_SLAVEOF_IP'))) {
+    $redis->connect(getenv('REDIS_SLAVEOF_IP'), getenv('REDIS_SLAVEOF_PORT'));
+  }
+  else {
+    $redis->connect('redis-mailcow', 6379);
+  }
+}
+catch (Exception $e) {
+  exit;
+}
 
 error_reporting(0);
 
@@ -25,6 +35,10 @@ if (strpos($data, 'autodiscover/outlook/responseschema') !== false) {
   ) {
     $autodiscover_config['autodiscoverType'] = 'activesync';
   }
+}
+
+if (getenv('SKIP_SOGO') == "y") {
+  $autodiscover_config['autodiscoverType'] = 'imap';
 }
 
 //$dsn = $database_type . ":host=" . $database_host . ";dbname=" . $database_name;
@@ -166,6 +180,9 @@ if ($login_role === "user") {
         <UsePOPAuth>on</UsePOPAuth>
         <SMTPLast>off</SMTPLast>
       </Protocol>
+    <?php
+    if (getenv('SKIP_SOGO') != "y") {
+    ?>
       <Protocol>
         <Type>CalDAV</Type>
         <Server>https://<?=$autodiscover_config['caldav']['server'];?><?php if ($autodiscover_config['caldav']['port'] != 443) echo ':'.$autodiscover_config['caldav']['port']; ?>/SOGo/dav/<?=$email;?>/</Server>
@@ -178,6 +195,9 @@ if ($login_role === "user") {
         <DomainRequired>off</DomainRequired>
         <LoginName><?=$email;?></LoginName>
       </Protocol>
+    <?php
+    }
+    ?>
     </Account>
   </Response>
 <?php

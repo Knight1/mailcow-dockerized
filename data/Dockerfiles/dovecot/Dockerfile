@@ -1,137 +1,131 @@
-FROM debian:stretch-slim
+FROM debian:buster-slim
 LABEL maintainer "Andre Peters <andre.peters@servercow.de>"
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG DOVECOT=2.3.14.1
 ENV LC_ALL C
-ENV DOVECOT_VERSION 2.3.2.1
-ENV PIGEONHOLE_VERSION 0.5.2
+ENV GOSU_VERSION 1.12
 
-RUN apt-get update && apt-get -y --no-install-recommends install \
-  automake \
-  autotools-dev \
-  build-essential \
+# Add groups and users before installing Dovecot to not break compatibility
+RUN groupadd -g 5000 vmail \
+  && groupadd -g 401 dovecot \
+  && groupadd -g 402 dovenull \
+  && groupadd -g 999 sogo \
+  && usermod -a -G sogo nobody \
+  && useradd -g vmail -u 5000 vmail -d /var/vmail \
+  && useradd -c "Dovecot unprivileged user" -d /dev/null -u 401 -g dovecot -s /bin/false dovecot \
+  && useradd -c "Dovecot login user" -d /dev/null -u 402 -g dovenull -s /bin/false dovenull \
+  && touch /etc/default/locale \
+  && apt-get update \
+  && apt-get -y --no-install-recommends install \
+  apt-transport-https \
   ca-certificates \
   cpanminus \
   curl \
-  default-libmysqlclient-dev \
   dnsutils \
-  libjson-webtoken-perl \
+  dirmngr \
+  gettext \
+  gnupg2 \
+  jq \
+  libauthen-ntlm-perl \
   libcgi-pm-perl \
   libcrypt-openssl-rsa-perl \
-  libdata-uniqid-perl \
-  libhtml-parser-perl \
-  libmail-imapclient-perl \
-  libparse-recdescent-perl \
-  libsys-meminfo-perl \
-  libtest-mockobject-perl \
-  libwww-perl \
-  libauthen-ntlm-perl \
-  libbz2-dev \
   libcrypt-ssleay-perl \
-  libcurl4-openssl-dev \
+  libdata-uniqid-perl \
   libdbd-mysql-perl \
   libdbi-perl \
   libdigest-hmac-perl \
-  libexpat1-dev \
+  libdist-checkconflicts-perl \
+  libencode-imaputf7-perl \
   libfile-copy-recursive-perl \
+  libfile-tail-perl \
+  libhtml-parser-perl \
   libio-compress-perl \
   libio-socket-inet6-perl \
   libio-socket-ssl-perl \
   libio-tee-perl \
   libipc-run-perl \
+  libjson-webtoken-perl \
   liblockfile-simple-perl \
-  liblz-dev \
-  liblz4-dev \
-  liblzma-dev \
+  libmail-imapclient-perl \
+  libmodule-implementation-perl \
   libmodule-scandeps-perl \
   libnet-ssleay-perl \
-  libpam-dev \
+  libpackage-stash-perl \
+  libpackage-stash-xs-perl \
   libpar-packer-perl \
+  libparse-recdescent-perl \
+  libproc-processtable-perl \
   libreadonly-perl \
-  libssl-dev \
+  libregexp-common-perl \
+  libsys-meminfo-perl \
   libterm-readkey-perl \
+  libtest-deep-perl \
+  libtest-fatal-perl \
+  libtest-mock-guard-perl \
+  libtest-mockobject-perl \
+  libtest-nowarnings-perl \
   libtest-pod-perl \
+  libtest-requires-perl \
   libtest-simple-perl \
+  libtest-warn-perl \
   libtry-tiny-perl \
   libunicode-string-perl \
-  libproc-processtable-perl \
-  libtest-nowarnings-perl \
-  libtest-deep-perl \
-  libtest-warn-perl \
-  libregexp-common-perl \
   liburi-perl \
-  lzma-dev \
-  make \
-  mysql-client \
+  libwww-perl \
+  lua-sql-mysql \
+  lua-socket \
+  mariadb-client \
   procps \
-  supervisor \
-  cron \
+  python3-pip \
   redis-server \
+  supervisor \
   syslog-ng \
   syslog-ng-core \
   syslog-ng-mod-redis \
-  && rm -rf /var/lib/apt/lists/*
+  wget \
+  && dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')" \
+  && wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch" \
+  && chmod +x /usr/local/bin/gosu \
+  && gosu nobody true \
+  && apt-key adv --fetch-keys https://repo.dovecot.org/DOVECOT-REPO-GPG \
+  && echo "deb https://repo.dovecot.org/ce-${DOVECOT}/debian/buster buster main" > /etc/apt/sources.list.d/dovecot.list \
+  && apt-get update \
+  && apt-get -y --no-install-recommends install \
+  dovecot-lua \
+  dovecot-managesieved \
+  dovecot-sieve \
+  dovecot-lmtpd \
+  dovecot-ldap \
+  dovecot-mysql \
+  dovecot-core \
+  dovecot-pop3d \
+  dovecot-imapd \
+  dovecot-solr \
+  && pip3 install mysql-connector-python html2text jinja2 redis \
+  && apt-get autoremove --purge -y \
+  && apt-get autoclean \
+  && rm -rf /var/lib/apt/lists/* \
+  && rm -rf /tmp/* /var/tmp/* /root/.cache/
 
-RUN curl https://www.dovecot.org/releases/2.3/dovecot-$DOVECOT_VERSION.tar.gz | tar xvz  \
-  && cd dovecot-$DOVECOT_VERSION \
-  && ./configure --with-solr --with-mysql --with-lzma --with-lz4 --with-ssl=openssl --with-notify=inotify --with-storages=mdbox,sdbox,maildir,mbox,imapc,pop3c --with-bzlib --with-zlib \
-  && make -j3 \
-  && make install \
-  && make clean \
-  && cd .. && rm -rf dovecot-$DOVECOT_VERSION \
-  && curl https://pigeonhole.dovecot.org/releases/2.3/dovecot-2.3-pigeonhole-$PIGEONHOLE_VERSION.tar.gz | tar xvz  \
-  && cd dovecot-2.3-pigeonhole-$PIGEONHOLE_VERSION \
-  && ./configure \
-  && make -j3 \
-  && make install \
-  && make clean \
-  && cd .. \
-  && rm -rf dovecot-2.3-pigeonhole-$PIGEONHOLE_VERSION
-
-RUN cpanm Data::Uniqid Mail::IMAPClient String::Util
-RUN echo '* * * * *   root  /usr/local/bin/imapsync_cron.pl' > /etc/cron.d/imapsync
-RUN echo '30 3 * * *  vmail /usr/local/bin/doveadm quota recalc -A' > /etc/cron.d/dovecot-sync
-RUN echo '* * * * *   vmail /usr/local/bin/trim_logs.sh >> /dev/stdout 2>&1' > /etc/cron.d/trim_logs
-RUN echo '25 * * * *  vmail /usr/local/bin/maildir_gc.sh >> /dev/stdout 2>&1' > /etc/cron.d/maildir_gc
-RUN echo '30 1 * * *  root  /usr/local/bin/sa-rules.sh  >> /dev/stdout 2>&1' > /etc/cron.d/sa-rules
 COPY trim_logs.sh /usr/local/bin/trim_logs.sh
+COPY clean_q_aged.sh /usr/local/bin/clean_q_aged.sh
 COPY syslog-ng.conf /etc/syslog-ng/syslog-ng.conf
+COPY syslog-ng-redis_slave.conf /etc/syslog-ng/syslog-ng-redis_slave.conf
 COPY imapsync /usr/local/bin/imapsync
-COPY postlogin.sh /usr/local/bin/postlogin.sh
-COPY imapsync_cron.pl /usr/local/bin/imapsync_cron.pl
-COPY report-spam.sieve /usr/local/lib/dovecot/sieve/report-spam.sieve
-COPY report-ham.sieve /usr/local/lib/dovecot/sieve/report-ham.sieve
-COPY rspamd-pipe-ham /usr/local/lib/dovecot/sieve/rspamd-pipe-ham
-COPY rspamd-pipe-spam /usr/local/lib/dovecot/sieve/rspamd-pipe-spam
+COPY imapsync_runner.pl /usr/local/bin/imapsync_runner.pl
+COPY report-spam.sieve /usr/lib/dovecot/sieve/report-spam.sieve
+COPY report-ham.sieve /usr/lib/dovecot/sieve/report-ham.sieve
+COPY rspamd-pipe-ham /usr/lib/dovecot/sieve/rspamd-pipe-ham
+COPY rspamd-pipe-spam /usr/lib/dovecot/sieve/rspamd-pipe-spam
 COPY sa-rules.sh /usr/local/bin/sa-rules.sh
 COPY maildir_gc.sh /usr/local/bin/maildir_gc.sh
 COPY docker-entrypoint.sh /
 COPY supervisord.conf /etc/supervisor/supervisord.conf
-
-RUN chmod +x /usr/local/lib/dovecot/sieve/rspamd-pipe-ham \
-  /usr/local/lib/dovecot/sieve/rspamd-pipe-spam \
-  /usr/local/bin/imapsync_cron.pl \
-  /usr/local/bin/postlogin.sh \
-  /usr/local/bin/imapsync \
-  /usr/local/bin/trim_logs.sh \
-  /usr/local/bin/sa-rules.sh \
-  /usr/local/bin/maildir_gc.sh
-
-RUN groupadd -g 5000 vmail \
-  && groupadd -g 401 dovecot \
-  && groupadd -g 402 dovenull \
-  && useradd -g vmail -u 5000 vmail -d /var/vmail \
-  && useradd -c "Dovecot unprivileged user" -d /dev/null -u 401 -g dovecot -s /bin/false dovecot \
-  && useradd -c "Dovecot login user" -d /dev/null -u 402 -g dovenull -s /bin/false dovenull
-
-RUN touch /etc/default/locale
-RUN apt-get purge -y build-essential automake autotools-dev default-libmysqlclient-dev libbz2-dev libcurl4-openssl-dev libexpat1-dev liblz-dev liblz4-dev liblzma-dev libpam-dev libssl-dev lzma-dev \
-  && apt-get autoremove --purge -y
+COPY stop-supervisor.sh /usr/local/sbin/stop-supervisor.sh
+COPY quarantine_notify.py /usr/local/bin/quarantine_notify.py
+COPY quota_notify.py /usr/local/bin/quota_notify.py
+COPY repl_health.sh /usr/local/bin/repl_health.sh
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
-
-RUN rm -rf \
-  /tmp/* \
-  /var/tmp/*
-

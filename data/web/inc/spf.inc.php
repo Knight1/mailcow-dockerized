@@ -1,11 +1,9 @@
 <?php
 error_reporting(0);
-
-function get_spf_allowed_hosts($domain)
-{
+function get_spf_allowed_hosts($check_domain, $expand_ipv6 = false) {
 	$hosts = array();
 	
-	$records = dns_get_record($domain, DNS_TXT);
+	$records = dns_get_record($check_domain, DNS_TXT);
 	foreach ($records as $record)
 	{
 		$txt = explode(' ', $record['entries'][0]);
@@ -26,13 +24,15 @@ function get_spf_allowed_hosts($domain)
 				$mod = explode('=', $mech);
 				if ($mod[0] == 'redirect') // handle a redirect
 				{
-					$hosts = get_spf_allowed_hosts($mod[1]);
+					$hosts = get_spf_allowed_hosts($mod[1],true);
 					return $hosts;
 				}
 			}
 			else
 			{
 				unset($cidr);
+				// reset domain to check_domain
+				$domain = $check_domain;
 				if (strpos($mech, ':') !== FALSE) // handle a domain specification
 				{
 					$split = explode(':', $mech);
@@ -47,7 +47,7 @@ function get_spf_allowed_hosts($domain)
 				}
 				
 				$new_hosts = array();
-				if ($mech == 'include') // handle an inclusion
+        if ($mech == 'include' && $check_domain != $domain) // handle an inclusion
 				{
 					$new_hosts = get_spf_allowed_hosts($domain);
 				}
@@ -77,7 +77,17 @@ function get_spf_allowed_hosts($domain)
 			}
 		}
 	}
-	
+	foreach ($hosts as &$host) {
+		if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+			if ($expand_ipv6 === true) {
+				$hex = unpack("H*hex", inet_pton($host));
+				$host = substr(preg_replace("/([A-f0-9]{4})/", "$1:", $hex['hex']), 0, -1);
+			}
+			else {
+				$host = $host;
+			}
+		}
+	}
 	return $hosts;
 }
 
@@ -113,9 +123,8 @@ function get_a_hosts($domain)
 		$hosts[] = $a_record['ip'];
 	}
 	$a_records = dns_get_record($domain, DNS_AAAA);
-	foreach ($a_records as $a_record)
-	{
-		$hosts[] = $a_record['ipv6'];
+	foreach ($a_records as $a_record) {
+    $hosts[] = $a_record['ipv6'];
 	}
 	
 	return $hosts;

@@ -7,9 +7,17 @@ function tls_policy_maps($_action, $_data = null, $attr = null) {
   }
   switch ($_action) {
     case 'add':
-      $dest = idn_to_ascii(trim($_data['dest']));
+      $dest = idn_to_ascii(trim($_data['dest']), 0, INTL_IDNA_VARIANT_UTS46);
       $policy = strtolower(trim($_data['policy']));
       $parameters = (isset($_data['parameters']) && !empty($_data['parameters'])) ? $_data['parameters'] : '';
+      if (empty($dest) || in_array($dest, array('.', '*', '@'))) {
+        $_SESSION['return'][] = array(
+          'type' => 'danger',
+          'log' => array(__FUNCTION__, $_action, $_data, $_attr),
+          'msg' => 'tls_policy_map_dest_invalid'
+        );
+        return false;
+      }
       if (!empty($parameters)) {
         foreach (explode(' ', $parameters) as $parameter) {
           if (!preg_match('/(.+)\=(.+)/i', $parameter)) {
@@ -53,7 +61,7 @@ function tls_policy_maps($_action, $_data = null, $attr = null) {
       foreach ($ids as $id) {
         $is_now = tls_policy_maps('details', $id);
         if (!empty($is_now)) {
-          $active = (isset($_data['active'])) ? intval($_data['active']) : $is_now['active_int'];
+          $active = (isset($_data['active'])) ? intval($_data['active']) : $is_now['active'];
           $dest = (!empty($_data['dest'])) ? $_data['dest'] : $is_now['dest'];
           $policy = (!empty($_data['policy'])) ? $_data['policy'] : $is_now['policy'];
           $parameters = (isset($_data['parameters'])) ? $_data['parameters'] : $is_now['parameters'];
@@ -65,6 +73,14 @@ function tls_policy_maps($_action, $_data = null, $attr = null) {
             'msg' => 'access_denied'
           );
           continue;
+        }
+        if (empty($dest) || in_array($dest, array('.', '*', '@'))) {
+          $_SESSION['return'][] = array(
+            'type' => 'danger',
+            'log' => array(__FUNCTION__, $_action, $_data, $_attr),
+            'msg' => 'tls_policy_map_dest_invalid'
+          );
+          return false;
         }
         if (!empty($parameters)) {
           foreach (explode(' ', $parameters) as $parameter) {
@@ -117,8 +133,7 @@ function tls_policy_maps($_action, $_data = null, $attr = null) {
         `dest`,
         `policy`,
         `parameters`,
-        `active` AS `active_int`,
-        CASE `active` WHEN 1 THEN '".$lang['mailbox']['yes']."' ELSE '".$lang['mailbox']['no']."' END AS `active`,
+        `active` AS `active`,
         `created`,
         `modified` FROM `tls_policy_override`
           WHERE `id` = :id");
