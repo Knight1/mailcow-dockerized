@@ -1,160 +1,102 @@
 <?php
-require_once $_SERVER['DOCUMENT_ROOT'] . '/modals/footer.php';
 logger();
-?>
-<div style="margin-bottom: 100px;"></div>
-<script src="/js/bootstrap.min.js"></script>
-<script src="/js/bootstrap-switch.min.js"></script>
-<script src="/js/bootstrap-slider.min.js"></script>
-<script src="/js/bootstrap-select.min.js"></script>
-<script src="/js/bootstrap-filestyle.min.js"></script>
-<script src="/js/notifications.min.js"></script>
-<script src="/js/formcache.min.js"></script>
-<script src="/js/google.charts.loader.js"></script>
-<script src="/js/numberedtextarea.min.js"></script>
-<script src="/js/sha1.min.js"></script>
-<script src="/js/u2f-api.js"></script>
-<script src="/js/api.js"></script>
-<script src="/js/mailcow.js"></script>
-<script>
-<?php
-$lang_footer = json_encode($lang['footer']);
-$lang_acl = json_encode($lang['acl']);
-$lang_tfa = json_encode($lang['tfa']);
-echo "var lang_footer = ". $lang_footer . ";\n";
-echo "var lang_acl = ". $lang_acl . ";\n";
-echo "var lang_tfa = ". $lang_tfa . ";\n";
-echo "var docker_timeout = ". $DOCKER_TIMEOUT * 1000 . ";\n";
-?>
-$(window).scroll(function() {
-  sessionStorage.scrollTop = $(this).scrollTop();
-});
-// Select language and reopen active URL without POST
-function setLang(sel) {
-  $.post( "<?= $_SERVER['REQUEST_URI']; ?>", {lang: sel} );
-  window.location.href = window.location.pathname + window.location.search;
+
+$hash = $js_minifier->getDataHash();
+$JSPath = '/tmp/' . $hash . '.js';
+if(!file_exists($JSPath)) {
+  $js_minifier->minify($JSPath);
+  cleanupJS($hash);
 }
-$(window).load(function() {
-  $(".overlay").hide();
-});
-$(document).ready(function() {
-  // TFA, CSRF, Alerts in footer.inc.php
-  // Other general functions in mailcow.js
-  <?php
-  $alertbox_log_parser = alertbox_log_parser($_SESSION);
-  if (is_array($alertbox_log_parser)) {
-    foreach($alertbox_log_parser as $log) {
-  ?>
-  mailcow_alert_box(<?=$log['msg'];?>, <?=$log['type'];?>);
-  <?php
-    }
+
+$alertbox_log_parser = alertbox_log_parser($_SESSION);
+$alerts = [];
+if (is_array($alertbox_log_parser)) {
+  foreach ($alertbox_log_parser as $log) {
+    $message = htmlspecialchars($log['msg'], ENT_QUOTES);
+    $message = strtr($message, ["\n" => '', "\r" => '', "\t" => '<br>']);
+    $alerts[trim($log['type'], '"')][] = trim($message, '"');
+  }
+  $alert = array_filter(array_unique($alerts));
+  foreach($alert as $alert_type => $alert_msg) {
+    // html breaks from mysql alerts, replace ` with '
+    $alerts[$alert_type] = implode('<hr class="alert-hr">', str_replace("`", "'", $alert_msg));
+  }
   unset($_SESSION['return']);
+}
+
+// map tfa details for twig
+$pending_tfa_authmechs = [];
+if (array_key_exists('pending_tfa_methods', $_SESSION)) {
+  foreach($_SESSION['pending_tfa_methods'] as $authdata){
+    $pending_tfa_authmechs[$authdata['authmech']] = false;
   }
-  ?>
-  // Confirm TFA modal
-  <?php if (isset($_SESSION['pending_tfa_method'])):?>
-  $('#ConfirmTFAModal').modal({
-    backdrop: 'static',
-    keyboard: false
-  });
-  $('#u2f_status_auth').html('<p><span class="glyphicon glyphicon-refresh glyphicon-spin"></span> Initializing, please wait...</p>');
-  $('#ConfirmTFAModal').on('shown.bs.modal', function(){
-      $(this).find('input[name=token]').focus();
-      // If U2F
-      if(document.getElementById("u2f_auth_data") !== null) {
-        $.ajax({
-          type: "GET",
-          cache: false,
-          dataType: 'script',
-          url: "/api/v1/get/u2f-authentication/<?= (isset($_SESSION['pending_mailcow_cc_username'])) ? rawurlencode($_SESSION['pending_mailcow_cc_username']) : null; ?>",
-          complete: function(data){
-            $('#u2f_status_auth').html(lang_tfa.waiting_usb_auth);
-            data;
-            setTimeout(function() {
-              console.log("Ready to authenticate");
-              u2f.sign(appId, challenge, registeredKeys, function(data) {
-                var form = document.getElementById('u2f_auth_form');
-                var auth = document.getElementById('u2f_auth_data');
-                console.log("Authenticate callback", data);
-                auth.value = JSON.stringify(data);
-                form.submit();
-              });
-            }, 1000);
-          }
-        });
-      }
-  });
-  $('#ConfirmTFAModal').on('hidden.bs.modal', function(){
-      $.ajax({
-        type: "GET",
-        cache: false,
-        dataType: 'script',
-        url: '/inc/ajax/destroy_tfa_auth.php',
-        complete: function(data){
-          window.location = window.location.href.split("#")[0];
-        }
-      });
-  });
-  <?php endif; ?>
-
-  // Set TFA modals
-  $('#selectTFA').change(function () {
-    if ($(this).val() == "yubi_otp") {
-      $('#YubiOTPModal').modal('show');
-      $("option:selected").prop("selected", false);
-    }
-    if ($(this).val() == "totp") {
-      $('#TOTPModal').modal('show');
-      $("option:selected").prop("selected", false);
-    }
-    if ($(this).val() == "u2f") {
-      $('#U2FModal').modal('show');
-      $("option:selected").prop("selected", false);
-      $('#u2f_status_reg').html('<p><span class="glyphicon glyphicon-refresh glyphicon-spin"></span> Initializing, please wait...</p>');
-      $.ajax({
-        type: "GET",
-        cache: false,
-        dataType: 'script',
-        url: "/api/v1/get/u2f-registration/<?= (isset($_SESSION['mailcow_cc_username'])) ? rawurlencode($_SESSION['mailcow_cc_username']) : null; ?>",
-        complete: function(data){
-          data;
-          setTimeout(function() {
-            console.log("Ready to register");
-            $('#u2f_status_reg').html(lang_tfa.waiting_usb_register);
-            u2f.register(appId, registerRequests, registeredKeys, function(deviceResponse) {
-              var form  = document.getElementById('u2f_reg_form');
-              var reg   = document.getElementById('u2f_register_data');
-              console.log("Register callback: ", data);
-              if (deviceResponse.errorCode && deviceResponse.errorCode != 0) {
-                var u2f_return_code = document.getElementById('u2f_return_code');
-                u2f_return_code.style.display = u2f_return_code.style.display === 'none' ? '' : null;
-                if (deviceResponse.errorCode == "4") { deviceResponse.errorCode = "4 - The presented device is not eligible for this request. For a registration request this may mean that the token is already registered, and for a sign request it may mean that the token does not know the presented key handle"; }
-                u2f_return_code.innerHTML = 'Error code: ' + deviceResponse.errorCode;
-                return;
-              }
-              reg.value = JSON.stringify(deviceResponse);
-              form.submit();
-            });
-          }, 1000);
-        }
-      });
-    }
-    if ($(this).val() == "none") {
-      $('#DisableTFAModal').modal('show');
-      $("option:selected").prop("selected", false);
-    }
-  });
-
-  // CSRF
-  $('<input type="hidden" value="<?= $_SESSION['CSRF']['TOKEN']; ?>">').attr('name', 'csrf_token').appendTo('form');
-  if (sessionStorage.scrollTop != "undefined") {
-    $(window).scrollTop(sessionStorage.scrollTop);
+  if (isset($pending_tfa_authmechs['webauthn'])) {
+    $pending_tfa_authmechs['webauthn'] = true;
   }
-});
-</script>
+  if (!isset($pending_tfa_authmechs['webauthn'])
+      && isset($pending_tfa_authmechs['yubi_otp'])) {
+    $pending_tfa_authmechs['yubi_otp'] = true;
+  }
+  if (!isset($pending_tfa_authmechs['webauthn'])
+      && !isset($pending_tfa_authmechs['yubi_otp'])
+      && isset($pending_tfa_authmechs['totp'])) {
+    $pending_tfa_authmechs['totp'] = true;
+  }
+  if (isset($pending_tfa_authmechs['u2f'])) {
+    $pending_tfa_authmechs['u2f'] = true;
+  }
+}
 
-</body>
-</html>
-<?php
+// globals
+$globalVariables = [
+  'mailcow_info' => array(
+    'version_tag' => $GLOBALS['MAILCOW_GIT_VERSION'],
+    'last_version_tag' => $GLOBALS['MAILCOW_LAST_GIT_VERSION'],
+    'git_owner' => $GLOBALS['MAILCOW_GIT_OWNER'],
+    'git_repo' => $GLOBALS['MAILCOW_GIT_REPO'],
+    'git_project_url' => $GLOBALS['MAILCOW_GIT_URL'],
+    'git_commit' => $GLOBALS['MAILCOW_GIT_COMMIT'],
+    'git_commit_date' => $GLOBALS['MAILCOW_GIT_COMMIT_DATE'],
+    'mailcow_branch' => $GLOBALS['MAILCOW_BRANCH'],
+    'updated_at' => $GLOBALS['MAILCOW_UPDATEDAT']
+  ),
+  'js_path' => '/cache/'.basename($JSPath),
+  'pending_tfa_methods' => @$_SESSION['pending_tfa_methods'],
+  'pending_tfa_authmechs' => $pending_tfa_authmechs,
+  'pending_mailcow_cc_username' => @$_SESSION['pending_mailcow_cc_username'],
+  'pending_tfa_setup' => !empty($_SESSION['pending_tfa_setup']),
+  'pending_pw_update_modal' => !empty($_SESSION['pending_pw_update']),
+  'lang_footer' => json_encode($lang['footer']),
+  'lang_acl' => json_encode($lang['acl']),
+  'lang_tfa' => json_encode($lang['tfa']),
+  'lang_fido2' => json_encode($lang['fido2']),
+  'lang_success' => json_encode($lang['success']),
+  'lang_danger' => json_encode($lang['danger']),
+  'lang_syncjobs' => json_encode($lang['syncjobs']),
+  'lang_groups' => json_encode($lang['groups']),
+  'docker_timeout' => $DOCKER_TIMEOUT,
+  'session_lifetime' => (int)$SESSION_LIFETIME,
+  'csrf_token' => $_SESSION['CSRF']['TOKEN'],
+  'pagination_size' => $PAGINATION_SIZE,
+  'log_pagination_size' => $LOG_PAGINATION_SIZE,
+  'alerts' => $alerts,
+  'totp_secret' => $tfa->createSecret(),
+];
+
+foreach ($globalVariables as $globalVariableName => $globalVariableValue) {
+  $twig->addGlobal($globalVariableName, $globalVariableValue);
+}
+
+if (is_array($template_data)) {
+  echo $twig->render($template, $template_data);
+}
+
+if (isset($_SESSION['mailcow_cc_api'])) {
+  session_regenerate_id(true);
+  session_unset();
+  session_destroy();
+  session_write_close();
+  header("Location: /");
+}
 $stmt = null;
 $pdo = null;

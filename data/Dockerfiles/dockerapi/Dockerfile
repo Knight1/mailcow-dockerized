@@ -1,10 +1,27 @@
-FROM alpine:3.8
-LABEL maintainer "Andre Peters <andre.peters@servercow.de>"
+FROM alpine:3.24
 
-RUN apk add -U --no-cache python2 python-dev py-pip gcc musl-dev tzdata openssl-dev libffi-dev \
-  && pip2 install --upgrade docker==3.0.1 flask flask-restful pyOpenSSL \
-  && apk del python-dev py2-pip gcc
+LABEL maintainer = "The Infrastructure Company GmbH <info@servercow.de>"
 
-COPY server.py /
+ARG PIP_BREAK_SYSTEM_PACKAGES=1
+WORKDIR /app
 
-CMD ["python2", "-u", "/server.py"]
+RUN apk add --update --no-cache python3 \
+  py3-pip \
+  openssl \
+  tzdata \
+  py3-psutil \
+  py3-redis \
+  py3-async-timeout \
+&& pip3 install --upgrade pip \
+  fastapi \
+  uvicorn \
+  aiodocker \
+  docker
+RUN mkdir /app/modules
+
+COPY docker-entrypoint.sh /app/
+COPY main.py /app/main.py
+COPY modules/ /app/modules/
+
+ENTRYPOINT ["/bin/sh", "/app/docker-entrypoint.sh"]
+CMD ["python", "main.py"]

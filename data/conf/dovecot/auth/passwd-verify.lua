@@ -1,0 +1,71 @@
+function auth_password_verify(request, password)
+  local json = require "cjson"
+  local ltn12 = require "ltn12"
+  local https = require "ssl.https"
+  https.TIMEOUT = 30
+
+  local req = {
+    username = request.user,
+    password = password,
+    -- address that connected to Dovecot, for proxied connections the proxy
+    real_rip = request.real_rip,
+    -- address of the client, also for proxied connections
+    client_ip = request.rip,
+    service = request.service
+  }
+  local req_json = json.encode(req)
+  local res = {}
+
+  local b, c = https.request {
+    method = "POST",
+    url = "https://nginx:9082",
+    source = ltn12.source.string(req_json),
+    headers = {
+      ["content-type"] = "application/json",
+      ["content-length"] = tostring(#req_json)
+    },
+    sink = ltn12.sink.table(res),
+    insecure = true
+  }
+
+  -- Returning PASSDB_RESULT_PASSWORD_MISMATCH will reset the user's auth cache entry.
+  -- Returning PASSDB_RESULT_INTERNAL_FAILURE keeps the existing cache entry,
+  -- even if the TTL has expired. Useful to avoid cache eviction during backend issues.
+
+  -- On a network-level failure (nginx unreachable, DNS failure, timeout) https.request
+  -- returns nil plus an error string, so c is not a numeric HTTP status code. Treat this
+  -- as a backend outage and keep the cache entry, rather than wiping it as a mismatch.
+  if type(c) ~= "number" then
+    dovecot.i_info("HTTP request to auth backend failed with " .. tostring(c) .. " for user " .. request.user)
+    return dovecot.auth.PASSDB_RESULT_INTERNAL_FAILURE, "Upstream unreachable"
+  end
+
+  -- 5xx: the backend or the identity provider cannot answer, a temporary failure and no failed login
+  if c >= 500 then
+    dovecot.i_info("HTTP request to auth backend failed with " .. tostring(c) .. " for user " .. request.user)
+    return dovecot.auth.PASSDB_RESULT_INTERNAL_FAILURE, "Upstream unavailable"
+  end
+
+  if c ~= 200 and c ~= 401 then
+    dovecot.i_info("HTTP request failed with " .. tostring(c) .. " for user " .. request.user)
+    return dovecot.auth.PASSDB_RESULT_PASSWORD_MISMATCH, "Upstream error"
+  end
+
+  local response_str = table.concat(res)
+  local is_response_valid, response_json = pcall(json.decode, response_str)
+
+  if not is_response_valid then
+    dovecot.i_info("Invalid JSON received: " .. response_str)
+    return dovecot.auth.PASSDB_RESULT_PASSWORD_MISMATCH, "Invalid response format"
+  end
+
+  if response_json.success == true then
+    return dovecot.auth.PASSDB_RESULT_OK, ""
+  end
+
+  return dovecot.auth.PASSDB_RESULT_PASSWORD_MISMATCH, "Failed to authenticate"
+end
+
+function auth_passdb_lookup(req)
+   return dovecot.auth.PASSDB_RESULT_USER_UNKNOWN, ""
+end

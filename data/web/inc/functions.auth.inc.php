@@ -1,0 +1,828 @@
+<?php
+function check_login($user, $pass, $extra = null) {
+  global $pdo;
+  global $redis;
+
+  $is_internal = $extra['is_internal'];
+  $role = $extra['role'];
+  $extra['service'] = !isset($extra['service']) ? 'NONE' : $extra['service'];
+  // set when the password is right, but the account does not allow this login
+  $denied = false;
+
+  // Try validate admin
+  if (!isset($role) || $role == "admin") {
+    $result = admin_login($user, $pass);
+    if ($result !== false){
+      return $result;
+    }
+  }
+
+  // Try validate domain admin
+  if (!isset($role) || $role == "domain_admin") {
+    $result = domainadmin_login($user, $pass);
+    if ($result !== false) {
+      return $result;
+    }
+  }
+
+
+  // Try validate app password
+  if (!isset($role) || $role == "app") {
+    $result = apppass_login($user, $pass, $extra, $denied);
+    if ($result !== false) {
+      $real_rip = ($_SERVER['HTTP_X_REAL_IP'] ?? $_SERVER['REMOTE_ADDR']);
+      set_sasl_log($user, $real_rip, $extra['service'], $pass);
+      return $result;
+    }
+  }
+
+  // Try validate user
+  if (!isset($role) || $role == "user") {
+    try {
+      $result = user_login($user, $pass, $extra, $denied);
+    } catch (\Mailcow\Auth\IdpUnavailable $e) {
+      // no failed login, netfilter must not count it
+      error_log("mailcow UI: Identity provider unavailable for " . $user . " by " . $_SERVER['REMOTE_ADDR'] . ": " . $e->getMessage());
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*', $e->getMessage()),
+        'msg' => 'iam_unavailable'
+      );
+      return false;
+    }
+    if ($result !== false) {
+      $real_rip = ($_SERVER['HTTP_X_REAL_IP'] ?? $_SERVER['REMOTE_ADDR']);
+      set_sasl_log($user, $real_rip, $extra['service']);
+      return $result;
+    }
+  }
+  // skip log and only return false if it's an internal request
+  if ($is_internal == true) return false;
+
+  // A denied login is logged, but not counted by netfilter (e.g. EAS/DAV clients of accounts without access)
+  $msg = ($denied ? "mailcow UI: Login denied for " : "mailcow UI: Invalid password for ") . $user . " by " . $_SERVER['REMOTE_ADDR'];
+  if (!isset($_SESSION['ldelay'])) {
+    $_SESSION['ldelay'] = "0";
+    if (!$denied) $redis->publish("F2B_CHANNEL", $msg);
+    error_log($msg);
+  }
+  elseif (!isset($_SESSION['mailcow_cc_username'])) {
+    $_SESSION['ldelay'] = $_SESSION['ldelay']+0.5;
+    if (!$denied) $redis->publish("F2B_CHANNEL", $msg);
+    error_log($msg);
+  }
+  $_SESSION['return'][] =  array(
+    'type' => 'danger',
+    'log' => array(__FUNCTION__, $user, '*'),
+    'msg' => 'login_failed'
+  );
+
+  sleep($_SESSION['ldelay']);
+  return false;
+}
+
+function admin_login($user, $pass){
+  global $pdo;
+
+  if (!filter_var($user, FILTER_VALIDATE_EMAIL) && !ctype_alnum(str_replace(array('_', '.', '-'), '', $user))) {
+    if (!$is_internal){
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*'),
+        'msg' => 'malformed_username'
+      );
+    }
+    return false;
+  }
+
+  $user = strtolower(trim($user));
+  $stmt = $pdo->prepare("SELECT `password`, `attributes` FROM `admin`
+      WHERE `superadmin` = '1'
+      AND `active` = '1'
+      AND `username` = :user");
+  $stmt->execute(array(':user' => $user));
+  $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+  // verify password
+  if (verify_hash($row['password'], $pass)) {
+    $admin_attrs = json_decode($row['attributes'], true) ?? [];
+
+    // Check force_pw_update
+    if (intval($admin_attrs['force_pw_update'] ?? 0) == 1) {
+      $_SESSION['pending_pw_update'] = true;
+    }
+
+    // check for tfa authenticators
+    $authenticators = get_tfa($user);
+    if (isset($authenticators['additional']) && is_array($authenticators['additional']) && count($authenticators['additional']) > 0) {
+      // active tfa authenticators found, set pending user login
+      $_SESSION['pending_mailcow_cc_username'] = $user;
+      $_SESSION['pending_mailcow_cc_role'] = "admin";
+      $_SESSION['pending_tfa_methods'] = $authenticators['additional'];
+      unset($_SESSION['ldelay']);
+      $_SESSION['return'][] =  array(
+        'type' => 'info',
+        'log' => array(__FUNCTION__, $user, '*'),
+        'msg' => 'awaiting_tfa_confirmation'
+      );
+      return "pending";
+    } else {
+      unset($_SESSION['ldelay']);
+      // Reactivate TFA if it was set to "deactivate TFA for next login"
+      $stmt = $pdo->prepare("UPDATE `tfa` SET `active`='1' WHERE `username` = :user");
+      $stmt->execute(array(':user' => $user));
+      // Check force_tfa: only force setup if NO TFA exists at all
+      if (intval($admin_attrs['force_tfa'] ?? 0) == 1 && !tfa_exists($user)) {
+        $_SESSION['pending_tfa_setup'] = true;
+      }
+      $_SESSION['return'][] =  array(
+        'type' => 'success',
+        'log' => array(__FUNCTION__, $user, '*'),
+        'msg' => array('logged_in_as', $user)
+      );
+      return "admin";
+    }
+  }
+
+  return false;
+}
+function domainadmin_login($user, $pass){
+  global $pdo;
+
+  if (!filter_var($user, FILTER_VALIDATE_EMAIL) && !ctype_alnum(str_replace(array('_', '.', '-'), '', $user))) {
+    if (!$is_internal){
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*'),
+        'msg' => 'malformed_username'
+      );
+    }
+    return false;
+  }
+
+  $stmt = $pdo->prepare("SELECT `password`, `attributes` FROM `admin`
+      WHERE `superadmin` = '0'
+      AND `active`='1'
+      AND `username` = :user");
+  $stmt->execute(array(':user' => $user));
+  $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+  // verify password
+  if (verify_hash($row['password'], $pass) !== false) {
+    $admin_attrs = json_decode($row['attributes'], true) ?? [];
+
+    // Check force_pw_update
+    if (intval($admin_attrs['force_pw_update'] ?? 0) == 1) {
+      $_SESSION['pending_pw_update'] = true;
+    }
+
+    // check for tfa authenticators
+    $authenticators = get_tfa($user);
+    if (isset($authenticators['additional']) && is_array($authenticators['additional']) && count($authenticators['additional']) > 0) {
+      $_SESSION['pending_mailcow_cc_username'] = $user;
+      $_SESSION['pending_mailcow_cc_role'] = "domainadmin";
+      $_SESSION['pending_tfa_methods'] = $authenticators['additional'];
+      unset($_SESSION['ldelay']);
+      $_SESSION['return'][] =  array(
+        'type' => 'info',
+        'log' => array(__FUNCTION__, $user, '*'),
+        'msg' => 'awaiting_tfa_confirmation'
+      );
+      return "pending";
+    }
+    else {
+      unset($_SESSION['ldelay']);
+      // Reactivate TFA if it was set to "deactivate TFA for next login"
+      $stmt = $pdo->prepare("UPDATE `tfa` SET `active`='1' WHERE `username` = :user");
+      $stmt->execute(array(':user' => $user));
+      // Check force_tfa: only force setup if NO TFA exists at all
+      if (intval($admin_attrs['force_tfa'] ?? 0) == 1 && !tfa_exists($user)) {
+        $_SESSION['pending_tfa_setup'] = true;
+      }
+      $_SESSION['return'][] =  array(
+        'type' => 'success',
+        'log' => array(__FUNCTION__, $user, '*'),
+        'msg' => array('logged_in_as', $user)
+      );
+      return "domainadmin";
+    }
+  }
+
+  return false;
+}
+function user_login($user, $pass, $extra = null, &$denied = false){
+  global $pdo;
+  global $iam_provider;
+  global $iam_settings;
+
+  $is_internal = $extra['is_internal'];
+  $extra['service'] = !isset($extra['service']) ? 'NONE' : $extra['service'];
+
+  if (!filter_var($user, FILTER_VALIDATE_EMAIL) && !ctype_alnum(str_replace(array('_', '.', '-'), '', $user))) {
+    if (!$is_internal){
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*'),
+        'msg' => 'malformed_username'
+      );
+    }
+    return false;
+  }
+
+  $stmt = $pdo->prepare("SELECT
+      mailbox.*,
+      domain.active AS d_active
+      FROM `mailbox`
+      INNER JOIN domain on mailbox.domain = domain.domain
+      WHERE `kind` NOT REGEXP 'location|thing|group'
+        AND `username` = :user");
+  $stmt->execute(array(':user' => $user));
+  $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+  // user does not exist, try call idp login and create user if possible via rest flow
+  if (!$row){
+    $result = false;
+    if ($iam_settings['authsource'] == 'keycloak' && intval($iam_settings['mailpassword_flow']) == 1){
+      $result = keycloak_mbox_login_rest($user, $pass, array('is_internal' => $is_internal, 'create' => true));
+    } else if ($iam_settings['authsource'] == 'ldap') {
+      $result = ldap_mbox_login($user, $pass, array('is_internal' => $is_internal, 'create' => true));
+    }
+    if ($result !== false){
+      // double check if mailbox is active
+      $stmt = $pdo->prepare("SELECT * FROM `mailbox`
+      INNER JOIN domain on mailbox.domain = domain.domain
+      WHERE `kind` NOT REGEXP 'location|thing|group'
+        AND `mailbox`.`active`='1'
+        AND `domain`.`active`='1'
+        AND `username` = :user");
+      $stmt->execute(array(':user' => $user));
+      $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+      if (!empty($row)) {
+        // check if user has access to service (imap, smtp, pop3, sieve, dav, eas) if service is set
+        $row['attributes'] = json_decode($row['attributes'], true);
+        if ($extra['service'] != 'NONE') {
+          $key = strtolower($extra['service']) . "_access";
+          if (isset($row['attributes'][$key]) && $row['attributes'][$key] != '1') {
+            $denied = true;
+            return false;
+          }
+        }
+        return true;
+      }
+      // the IdP accepted the password, the mailbox is inactive
+      $denied = true;
+    }
+    clear_session();
+    return false;
+  }
+
+  // check if user has access to service (imap, smtp, pop3, sieve) if service is set
+  $row['attributes'] = json_decode($row['attributes'], true);
+  $key = strtolower($extra['service']) . "_access";
+  // Shared mailboxes have no login of their own, members open them through group shares.
+  // Checked before asking an IdP (no template side effects).
+  if (($row['attributes']['shared'] ?? '0') == '1'
+    || ($extra['service'] != 'NONE' && isset($row['attributes'][$key]) && $row['attributes'][$key] != '1')
+    || $row['active'] != '1' || $row['d_active'] != '1') {
+    // Denied, not failed, unless the password is wrong; IdP passwords are not checked for that
+    if ($row['authsource'] != 'mailcow' || verify_hash($row['password'], $pass) !== false) {
+      $denied = true;
+    }
+    return false;
+  }
+  switch ($row['authsource']) {
+    case 'keycloak':
+      // user authsource is keycloak, try using via rest flow
+      if (intval($iam_settings['mailpassword_flow']) == 1){
+        $result = keycloak_mbox_login_rest($user, $pass, array('is_internal' => $is_internal));
+        if ($result !== false) {
+          // double check if mailbox and domain is active
+          $stmt = $pdo->prepare("SELECT * FROM `mailbox`
+          INNER JOIN domain on mailbox.domain = domain.domain
+          WHERE `kind` NOT REGEXP 'location|thing|group'
+            AND `mailbox`.`active`='1'
+            AND `domain`.`active`='1'
+            AND `username` = :user");
+          $stmt->execute(array(':user' => $user));
+          $row = $stmt->fetch(PDO::FETCH_ASSOC);
+          if (empty($row)) {
+            $denied = true;
+            return false;
+          }
+
+          $row['attributes'] = json_decode($row['attributes'], true);
+
+          // check for tfa authenticators
+          $authenticators = get_tfa($user);
+          if (isset($authenticators['additional']) && is_array($authenticators['additional']) && count($authenticators['additional']) > 0 && !$is_internal) {
+            // authenticators found, init TFA flow
+            $_SESSION['pending_mailcow_cc_username'] = $user;
+            $_SESSION['pending_mailcow_cc_role'] = "user";
+            $_SESSION['pending_tfa_methods'] = $authenticators['additional'];
+            unset($_SESSION['ldelay']);
+            $_SESSION['return'][] =  array(
+              'type' => 'success',
+              'log' => array(__FUNCTION__, $user, '*', 'Provider: Keycloak'),
+              'msg' => array('logged_in_as', $user)
+            );
+            return "pending";
+          } else if (!isset($authenticators['additional']) || !is_array($authenticators['additional']) || count($authenticators['additional']) == 0) {
+            // no authenticators found, login successfull
+            if (!$is_internal){
+              unset($_SESSION['ldelay']);
+              // Reactivate TFA if it was set to "deactivate TFA for next login"
+              $stmt = $pdo->prepare("UPDATE `tfa` SET `active`='1' WHERE `username` = :user");
+              $stmt->execute(array(':user' => $user));
+              // Check force_tfa: only force setup if NO TFA exists at all
+              if (intval($row['attributes']['force_tfa']) == 1 && !tfa_exists($user)) {
+                $_SESSION['pending_tfa_setup'] = true;
+              }
+              $_SESSION['return'][] =  array(
+                'type' => 'success',
+                'log' => array(__FUNCTION__, $user, '*', 'Provider: Keycloak'),
+                'msg' => array('logged_in_as', $user)
+              );
+            }
+            return "user";
+          }
+        }
+        return $result;
+      } else {
+        return false;
+      }
+    break;
+    case 'ldap':
+      // user authsource is ldap
+      $result = ldap_mbox_login($user, $pass, array('is_internal' => $is_internal));
+      if ($result !== false) {
+        // double check if mailbox and domain is active
+        $stmt = $pdo->prepare("SELECT * FROM `mailbox`
+        INNER JOIN domain on mailbox.domain = domain.domain
+        WHERE `kind` NOT REGEXP 'location|thing|group'
+          AND `mailbox`.`active`='1'
+          AND `domain`.`active`='1'
+          AND `username` = :user");
+        $stmt->execute(array(':user' => $user));
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (empty($row)) {
+          $denied = true;
+          return false;
+        }
+
+        $row['attributes'] = json_decode($row['attributes'], true);
+
+        // check for tfa authenticators
+        $authenticators = get_tfa($user);
+        if (isset($authenticators['additional']) && is_array($authenticators['additional']) && count($authenticators['additional']) > 0 && !$is_internal) {
+          // authenticators found, init TFA flow
+          $_SESSION['pending_mailcow_cc_username'] = $user;
+          $_SESSION['pending_mailcow_cc_role'] = "user";
+          $_SESSION['pending_tfa_methods'] = $authenticators['additional'];
+          unset($_SESSION['ldelay']);
+          $_SESSION['return'][] =  array(
+            'type' => 'success',
+            'log' => array(__FUNCTION__, $user, '*', 'Provider: LDAP'),
+            'msg' => array('logged_in_as', $user)
+          );
+          return "pending";
+        } else if (!isset($authenticators['additional']) || !is_array($authenticators['additional']) || count($authenticators['additional']) == 0) {
+          // no authenticators found, login successfull
+          if (!$is_internal){
+            unset($_SESSION['ldelay']);
+            // Reactivate TFA if it was set to "deactivate TFA for next login"
+            $stmt = $pdo->prepare("UPDATE `tfa` SET `active`='1' WHERE `username` = :user");
+            $stmt->execute(array(':user' => $user));
+            // Check force_tfa: only force setup if NO TFA exists at all
+            if (intval($row['attributes']['force_tfa']) == 1 && !tfa_exists($user)) {
+              $_SESSION['pending_tfa_setup'] = true;
+            }
+            $_SESSION['return'][] =  array(
+              'type' => 'success',
+              'log' => array(__FUNCTION__, $user, '*', 'Provider: LDAP'),
+              'msg' => array('logged_in_as', $user)
+            );
+          }
+          return "user";
+        }
+      }
+      return $result;
+    break;
+    case 'mailcow':
+      // verify password
+      if (verify_hash($row['password'], $pass) !== false) {
+
+        if (intval($row['attributes']['force_pw_update']) == 1) {
+          $_SESSION['pending_pw_update'] = true;
+        }
+
+        // check for tfa authenticators
+        $authenticators = get_tfa($user);
+        if (isset($authenticators['additional']) && is_array($authenticators['additional']) && count($authenticators['additional']) > 0 && !$is_internal) {
+          // authenticators found, init TFA flow
+          $_SESSION['pending_mailcow_cc_username'] = $user;
+          $_SESSION['pending_mailcow_cc_role'] = "user";
+          $_SESSION['pending_tfa_methods'] = $authenticators['additional'];
+          unset($_SESSION['ldelay']);
+          $_SESSION['return'][] =  array(
+            'type' => 'success',
+            'log' => array(__FUNCTION__, $user, '*', 'Provider: mailcow'),
+            'msg' => array('logged_in_as', $user)
+          );
+          return "pending";
+        } else if (!isset($authenticators['additional']) || !is_array($authenticators['additional']) || count($authenticators['additional']) == 0) {
+          // no authenticators found, login successfull
+          if (!$is_internal){
+            unset($_SESSION['ldelay']);
+            // Reactivate TFA if it was set to "deactivate TFA for next login"
+            $stmt = $pdo->prepare("UPDATE `tfa` SET `active`='1' WHERE `username` = :user");
+            $stmt->execute(array(':user' => $user));
+            // Check force_tfa: only force setup if NO TFA exists at all
+            if (intval($row['attributes']['force_tfa']) == 1 && !tfa_exists($user)) {
+              $_SESSION['pending_tfa_setup'] = true;
+            }
+            $_SESSION['return'][] =  array(
+              'type' => 'success',
+              'log' => array(__FUNCTION__, $user, '*', 'Provider: mailcow'),
+              'msg' => array('logged_in_as', $user)
+            );
+          }
+          return "user";
+        }
+        // TFA accounts use app passwords in mail clients
+        $denied = true;
+      }
+    break;
+  }
+
+  return false;
+}
+function apppass_login($user, $pass, $extra = null, &$denied = false){
+  global $pdo;
+
+  $is_internal = $extra['is_internal'];
+
+  if (!filter_var($user, FILTER_VALIDATE_EMAIL) && !ctype_alnum(str_replace(array('_', '.', '-'), '', $user))) {
+    if (!$is_internal){
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*'),
+        'msg' => 'malformed_username'
+      );
+    }
+    return false;
+  }
+
+  $extra['service'] = !isset($extra['service']) ? 'NONE' : $extra['service'];
+  if (!$is_internal && $extra['service'] == 'NONE') {
+    return false;
+  }
+
+  // fetch app password data, inactive ones too: their right password is denied, not failed
+  $stmt = $pdo->prepare("SELECT `app_passwd`.*, `app_passwd`.`password` as `password`, `app_passwd`.`id` as `app_passwd_id`,
+    `mailbox`.`active` as `mailbox_active`, `domain`.`active` as `domain_active`, `mailbox`.`attributes` as `mailbox_attributes` FROM `app_passwd`
+    INNER JOIN `mailbox` ON `mailbox`.`username` = `app_passwd`.`mailbox`
+    INNER JOIN `domain` ON `mailbox`.`domain` = `domain`.`domain`
+    WHERE `mailbox`.`kind` NOT REGEXP 'location|thing|group'
+      AND `app_passwd`.`mailbox` = :user"
+  );
+  // fetch password data
+  $stmt->execute(array(
+    ':user' => $user,
+  ));
+  $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+  foreach ($rows as $row) {
+    // verify password
+    if (verify_hash($row['password'], $pass) === false) {
+      continue;
+    }
+
+    $key = strtolower($extra['service']) . '_access';
+    $mailbox_attributes = json_decode($row['mailbox_attributes'], true);
+    // the protocols of the mailbox only limit direct user access, app passwords have their own
+    if ($row['active'] != '1' || $row['mailbox_active'] != '1' || $row['domain_active'] != '1'
+      || ($mailbox_attributes['shared'] ?? '0') == '1'
+      || ($extra['service'] != 'NONE' && $row[$key] != '1')) {
+      // right password, but the app password does not allow this login
+      $denied = true;
+      continue;
+    }
+
+    $_SESSION['app_passwd_id'] = $row['app_passwd_id'];
+    unset($_SESSION['ldelay']);
+    return "user";
+  }
+
+  return false;
+}
+// Keycloak REST Api Flow - auth user by mailcow_password attribute
+// This password will be used for direct UI, IMAP and SMTP Auth
+// To use direct user credentials, only Authorization Code Flow is valid
+function keycloak_mbox_login_rest($user, $pass, $extra = null){
+  global $pdo;
+  global $iam_provider;
+  global $iam_settings;
+
+  $is_internal = $extra['is_internal'];
+  $create = $extra['create'];
+
+  if (!filter_var($user, FILTER_VALIDATE_EMAIL) && !ctype_alnum(str_replace(array('_', '.', '-'), '', $user))) {
+    if (!$is_internal){
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*'),
+        'msg' => 'malformed_username'
+      );
+    }
+    return false;
+  }
+  if (!$iam_provider) {
+    throw new \Mailcow\Auth\IdpUnavailable('Keycloak is not configured completely');
+  }
+
+  // get access_token for service account of mailcow client
+  $admin_token = identity_provider("get-keycloak-admin-token");
+  if (!$admin_token) {
+    throw new \Mailcow\Auth\IdpUnavailable('Could not get an admin token from Keycloak');
+  }
+
+  // get the mailcow_password attribute from keycloak user
+  $url = "{$iam_settings['server_url']}/admin/realms/{$iam_settings['realm']}/users";
+  // as string, http_build_query() would send exact=1 and Keycloak would search for substrings
+  $queryParams = array('email' => $user, 'exact' => 'true');
+  $queryString = http_build_query($queryParams);
+  $curl = curl_init();
+  curl_setopt($curl, CURLOPT_TIMEOUT, 7);
+  curl_setopt($curl, CURLOPT_URL, $url . '?' . $queryString);
+  curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+  curl_setopt($curl, CURLOPT_HTTPHEADER, array(
+      'Authorization: Bearer ' . $admin_token,
+      'Content-Type: application/json'
+  ));
+  if (intval($iam_settings['ignore_ssl_error']) == 1) {
+    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($curl, CURLOPT_SSL_VERIFYHOST, 0);
+  }
+  $users = json_decode(curl_exec($curl), true);
+  $code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+  curl_close($curl);
+  // the password is checked below, a failed request is never a wrong password
+  if ($code != 200) {
+    throw new \Mailcow\Auth\IdpUnavailable('Keycloak returned HTTP ' . $code);
+  }
+  // exact=true can still return several users with that email, only the exact address counts
+  if (is_array($users)) {
+    $users = array_values(array_filter($users, fn($u) => is_array($u) && strcasecmp((string)($u['email'] ?? ''), $user) === 0));
+  }
+  if (!is_array($users) || count($users) != 1) {
+    return false;
+  }
+  $user_res = $users[0];
+  if (empty($user_res['enabled'])) {
+    return false;
+  }
+  if (!isset($user_res['attributes']['mailcow_password']) || !is_array($user_res['attributes']['mailcow_password'])){
+    $_SESSION['return'][] =  array(
+      'type' => 'danger',
+      'log' => array(__FUNCTION__, $user, '*', 'User has no mailcow_password attribute'),
+      'msg' => 'generic_server_error'
+    );
+    return false;
+  }
+  if (empty($user_res['attributes']['mailcow_password'][0])){
+    $_SESSION['return'][] =  array(
+      'type' => 'danger',
+      'log' => array(__FUNCTION__, $user, '*', "User's mailcow_password attribute is empty"),
+      'msg' => 'generic_server_error'
+    );
+    return false;
+  }
+
+  // validate mailcow_password
+  $mailcow_password = $user_res['attributes']['mailcow_password'][0];
+  if (!verify_hash($mailcow_password, $pass)) {
+    return false;
+  }
+
+  // get mapped template
+  $name = trim(($user_res['firstName'] ?? '') . ' ' . ($user_res['lastName'] ?? ''));
+  $idp_login = \Mailcow\Auth\AuthModule::fromGlobals()->idp;
+  $mapped_template = $idp_login->mappedTemplate($user_res['attributes']['mailcow_template'] ?? array());
+
+  if (!$create) {
+    if (!$idp_login->verifyLink('keycloak', $user, (string)($user_res['id'] ?? ''))) {
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*', 'The mailbox is linked to another IdP user'),
+        'msg' => 'generic_server_error'
+      );
+      return false;
+    }
+    // login success
+    $update_template = $idp_login->templateFor($user, $mapped_template);
+    if ($update_template !== null) {
+      // update user
+      $_SESSION['access_all_exception'] = '1';
+      mailbox('edit', 'mailbox_from_template', array(
+        'username' => $user,
+        'name' => $name,
+        'template' => $update_template
+      ));
+      $_SESSION['access_all_exception'] = '0';
+    }
+    return 'user';
+  }
+
+  // check if login provisioning is enabled before creating user
+  if (!$iam_settings['login_provisioning']){
+    if (!$is_internal){
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, "Auto-create users on login is deactivated"),
+        'msg' => 'login_failed'
+      );
+    }
+    return false;
+  }
+  // check if matching attribute exist
+  if ($mapped_template === null) {
+    if (!empty($iam_settings['default_template'])) {
+      $mbox_template = $iam_settings['default_template'];
+    } else {
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*', 'No matching attribute mapping was found'),
+        'msg' => 'generic_server_error'
+      );
+      return false;
+    }
+  } else {
+    $mbox_template = $mapped_template;
+  }
+
+  if (!$idp_login->mayCreate('keycloak', $user, (string)($user_res['id'] ?? ''))) {
+    $_SESSION['return'][] =  array(
+      'type' => 'danger',
+      'log' => array(__FUNCTION__, $user, '*', 'The IdP user is linked to another mailbox'),
+      'msg' => 'generic_server_error'
+    );
+    return false;
+  }
+
+  // create mailbox
+  $_SESSION['access_all_exception'] = '1';
+  $create_res = mailbox('add', 'mailbox_from_template', array(
+    'domain' => explode('@', $user)[1],
+    'local_part' => explode('@', $user)[0],
+    'name' => $name,
+    'authsource' => 'keycloak',
+    'template' => $mbox_template
+  ));
+  $_SESSION['access_all_exception'] = '0';
+  if (!$create_res){
+    clear_session();
+    $_SESSION['return'][] =  array(
+      'type' => 'danger',
+      'log' => array(__FUNCTION__, $user, '*', 'Could not create mailbox on login'),
+      'msg' => 'generic_server_error'
+    );
+    return false;
+  }
+  $idp_login->storeLink('keycloak', $user, (string)($user_res['id'] ?? ''));
+
+  return 'user';
+}
+function ldap_mbox_login($user, $pass, $extra = null){
+  global $pdo;
+  global $iam_provider;
+  global $iam_settings;
+
+  $is_internal = $extra['is_internal'];
+  $create = $extra['create'];
+
+  if (!filter_var($user, FILTER_VALIDATE_EMAIL) && !ctype_alnum(str_replace(array('_', '.', '-'), '', $user))) {
+    if (!$is_internal){
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*'),
+        'msg' => 'malformed_username'
+      );
+    }
+    return false;
+  }
+  if (!$iam_provider) {
+    // identity_provider('init') could not connect
+    throw new \Mailcow\Auth\IdpUnavailable('No connection to the LDAP server');
+  }
+
+  try {
+    $ldap_query = $iam_provider->query();
+    if (!empty($iam_settings['filter'])) {
+      $ldap_query = $ldap_query->rawFilter($iam_settings['filter']);
+    }
+    $ldap_query = $ldap_query->where($iam_settings['username_field'], '=', $user)
+      ->select(array_values(array_filter(array_merge([$iam_settings['username_field'], $iam_settings['attribute_field'], 'displayname', 'distinguishedname', 'dn'],
+        \Mailcow\Identity\Directory\LdapDirectory::idAttributes($iam_settings['id_attribute'] ?? '')))));
+
+    $entries = $ldap_query->get();
+  } catch (Exception $e) {
+    throw new \Mailcow\Auth\IdpUnavailable('LDAP search failed: ' . $e->getMessage(), 0, $e);
+  }
+  // the login name must identify exactly one entry, several matches are ambiguous
+  if (!is_array($entries) || count($entries) != 1) {
+    return false;
+  }
+  $user_res = reset($entries);
+  $idp_login = \Mailcow\Auth\AuthModule::fromGlobals()->idp;
+  if (!$idp_login->verifyLdapPassword($iam_provider, (string)$user_res['dn'], (string)$pass)) {
+    return false;
+  }
+
+  // get mapped template
+  $mapped_template = $idp_login->mappedTemplate($user_res[$iam_settings['attribute_field']] ?? array());
+  $external_id = \Mailcow\Identity\Directory\LdapDirectory::entryId($user_res, $iam_settings['id_attribute'] ?? '');
+
+  if (!$create) {
+    if (!$idp_login->verifyLink('ldap', $user, $external_id)) {
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*', 'The mailbox is linked to another IdP user'),
+        'msg' => 'generic_server_error'
+      );
+      return false;
+    }
+    // login success
+    $update_template = $idp_login->templateFor($user, $mapped_template);
+    if ($update_template !== null) {
+      // update user
+      $_SESSION['access_all_exception'] = '1';
+      mailbox('edit', 'mailbox_from_template', array(
+        'username' => $user,
+        'name' => $user_res['displayname'][0],
+        'template' => $update_template
+      ));
+      $_SESSION['access_all_exception'] = '0';
+    }
+    return 'user';
+  }
+
+  // check if login provisioning is enabled before creating user
+  if (!$iam_settings['login_provisioning']){
+    if (!$is_internal){
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, "Auto-create users on login is deactivated"),
+        'msg' => 'login_failed'
+      );
+    }
+    return false;
+  }
+  // check if matching attribute exist
+  if ($mapped_template === null) {
+    if (!empty($iam_settings['default_template'])) {
+      $mbox_template = $iam_settings['default_template'];
+    } else {
+      $_SESSION['return'][] =  array(
+        'type' => 'danger',
+        'log' => array(__FUNCTION__, $user, '*', 'No matching attribute mapping was found'),
+        'msg' => 'generic_server_error'
+      );
+      return false;
+    }
+  } else {
+    $mbox_template = $mapped_template;
+  }
+
+  if (!$idp_login->mayCreate('ldap', $user, $external_id)) {
+    $_SESSION['return'][] =  array(
+      'type' => 'danger',
+      'log' => array(__FUNCTION__, $user, '*', 'The IdP user is linked to another mailbox'),
+      'msg' => 'generic_server_error'
+    );
+    return false;
+  }
+
+  // create mailbox
+  $_SESSION['access_all_exception'] = '1';
+  $create_res = mailbox('add', 'mailbox_from_template', array(
+    'domain' => explode('@', $user)[1],
+    'local_part' => explode('@', $user)[0],
+    'name' => $user_res['displayname'][0],
+    'authsource' => 'ldap',
+    'template' => $mbox_template
+  ));
+  $_SESSION['access_all_exception'] = '0';
+  if (!$create_res){
+    clear_session();
+    $_SESSION['return'][] =  array(
+      'type' => 'danger',
+      'log' => array(__FUNCTION__, $user, '*', 'Could not create mailbox on login'),
+      'msg' => 'generic_server_error'
+    );
+    return false;
+  }
+  $idp_login->storeLink('ldap', $user, $external_id);
+
+  return 'user';
+}

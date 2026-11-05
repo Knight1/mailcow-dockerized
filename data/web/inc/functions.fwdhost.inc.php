@@ -1,8 +1,8 @@
 <?php
 function fwdhost($_action, $_data = null) {
   require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/spf.inc.php';
-	global $redis;
-	global $lang;
+  global $redis;
+  global $lang;
   $_data_log = $_data;
   switch ($_action) {
     case 'add':
@@ -57,7 +57,7 @@ function fwdhost($_action, $_data = null) {
       $_SESSION['return'][] = array(
         'type' => 'success',
         'log' => array(__FUNCTION__, $_action, $_data_log),
-        'msg' => array('forwarding_host_added', htmlspecialchars(implode(', ', $hosts)))
+        'msg' => array('forwarding_host_added', htmlspecialchars(implode(', ', (array)$hosts)))
       );
     break;
     case 'edit':
@@ -108,6 +108,14 @@ function fwdhost($_action, $_data = null) {
       }
     break;
     case 'delete':
+      if ($_SESSION['mailcow_cc_role'] != "admin") {
+        $_SESSION['return'][] = array(
+          'type' => 'danger',
+          'log' => array(__FUNCTION__, $_action, $_data_log),
+          'msg' => 'access_denied'
+        );
+        return false;
+      }
       $hosts = (array)$_data['forwardinghost'];
       foreach ($hosts as $host) {
         try {

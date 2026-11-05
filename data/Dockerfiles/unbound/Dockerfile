@@ -1,20 +1,40 @@
-FROM alpine:3.8
+FROM alpine:3.24
 
-LABEL maintainer "Andre Peters <andre.peters@servercow.de>"
+LABEL maintainer = "The Infrastructure Company GmbH <info@servercow.de>"
 
+# install unbound from alpine:edge to get security patches
+# minimum version is pinned
+RUN apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main "unbound>=1.26.2-r0"
+
+# install other packages from regular alpine stable repo
 RUN apk add --update --no-cache \
 	curl \
-	unbound \
+	bind-tools \
+	coreutils \
 	bash \
 	openssl \
 	drill \
+	tzdata \
+	syslog-ng \
+	supervisor \
 	&& curl -o /etc/unbound/root.hints https://www.internic.net/domain/named.cache \
 	&& chown root:unbound /etc/unbound \
-  && adduser unbound tty \
+    && adduser unbound tty \
 	&& chmod 775 /etc/unbound
 
 EXPOSE 53/udp 53/tcp
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 
+# healthcheck (dig, ping)
+COPY healthcheck.sh /healthcheck.sh
+COPY syslog-ng.conf /etc/syslog-ng/syslog-ng.conf
+COPY supervisord.conf /etc/supervisor/supervisord.conf
+COPY stop-supervisor.sh /usr/local/sbin/stop-supervisor.sh
+
+RUN chmod +x /healthcheck.sh
+HEALTHCHECK --interval=30s --timeout=10s \
+  CMD sh -c '[ -f /tmp/healthcheck_status ] && [ "$(cat /tmp/healthcheck_status)" -eq 0 ] || exit 1'
+
 ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]

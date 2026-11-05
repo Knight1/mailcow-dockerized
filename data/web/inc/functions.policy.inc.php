@@ -1,9 +1,9 @@
 <?php
 function policy($_action, $_scope, $_data = null) {
-	global $pdo;
-	global $redis;
-	global $lang;
-	$_data_log = $_data;
+  global $pdo;
+  global $redis;
+  global $lang;
+  $_data_log = $_data;
   switch ($_action) {
     case 'add':
       if (!isset($_SESSION['acl']['spam_policy']) || $_SESSION['acl']['spam_policy'] != "1" ) {
@@ -26,7 +26,7 @@ function policy($_action, $_scope, $_data = null) {
               );
               return false;
             }
-            $object = idn_to_ascii(strtolower(trim($object)));
+            $object = idn_to_ascii(strtolower(trim($object)), 0, INTL_IDNA_VARIANT_UTS46);
           }
           else {
             $_SESSION['return'][] = array(
@@ -42,7 +42,7 @@ function policy($_action, $_scope, $_data = null) {
           elseif ($_data['object_list'] == "wl") {
             $object_list = "whitelist_from";
           }
-          $object_from = preg_replace('/\.+/', '.', rtrim(preg_replace("/\.\*/", "*", trim(strtolower($_data['object_from']))), '.'));
+          $object_from = trim(strtolower($_data['object_from']));
           if (!ctype_alnum(str_replace(array('@', '_', '.', '-', '*'), '', $object_from))) {
             $_SESSION['return'][] = array(
               'type' => 'danger',
@@ -104,7 +104,7 @@ function policy($_action, $_scope, $_data = null) {
           elseif ($_data['object_list'] == "wl") {
             $object_list = "whitelist_from";
           }
-          $object_from = preg_replace('/\.+/', '.', rtrim(preg_replace("/\.\*/", "*", trim(strtolower($_data['object_from']))), '.'));
+          $object_from = trim(strtolower($_data['object_from']));
           if (!ctype_alnum(str_replace(array('@', '_', '.', '-', '*'), '', $object_from))) {
             $_SESSION['return'][] = array(
               'type' => 'danger',
@@ -183,7 +183,7 @@ function policy($_action, $_scope, $_data = null) {
                 );
                 continue;
               }
-              $object = idn_to_ascii(strtolower(trim($object)));
+              $object = idn_to_ascii(strtolower(trim($object)), 0, INTL_IDNA_VARIANT_UTS46);
             }
             else {
               $_SESSION['return'][] = array(
@@ -261,7 +261,7 @@ function policy($_action, $_scope, $_data = null) {
             $_SESSION['return'][] = array(
               'type' => 'success',
               'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
-              'msg' => array('items_deleted', implode(', ', $prefids))
+              'msg' => array('items_deleted', implode(', ', (array)$prefids))
             );
           }
         break;
@@ -277,7 +277,7 @@ function policy($_action, $_scope, $_data = null) {
             if (!hasDomainAccess($_SESSION['mailcow_cc_username'], $_SESSION['mailcow_cc_role'], $_data)) {
               return false;
             }
-            $_data = idn_to_ascii(strtolower(trim($_data)));
+            $_data = idn_to_ascii(strtolower(trim($_data)), 0, INTL_IDNA_VARIANT_UTS46);
           }
 
           // WHITELIST

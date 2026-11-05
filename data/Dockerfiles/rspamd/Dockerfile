@@ -1,28 +1,40 @@
-FROM ubuntu:xenial
-LABEL maintainer "Andre Peters <andre.peters@servercow.de>"
+FROM debian:trixie-slim
+LABEL maintainer="The Infrastructure Company GmbH <info@servercow.de>"
 
 ARG DEBIAN_FRONTEND=noninteractive
-ENV LC_ALL C
+ARG RSPAMD_VER=rspamd_4.2.3-1~50bde75
+ARG CODENAME=trixie
+ENV LC_ALL=C
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
   tzdata \
-	ca-certificates \
-	gnupg2 \
-  gnupg-curl \
-	apt-transport-https \
-	&& apt-key adv --fetch-keys https://rspamd.com/apt/gpg.key \
-	&& echo "deb https://rspamd.com/apt-stable/ xenial main" > /etc/apt/sources.list.d/rspamd.list \
-	&& apt-get update && apt-get install -y rspamd \
-	&& rm -rf /var/lib/apt/lists/* \
-	&& echo '.include $LOCAL_CONFDIR/local.d/rspamd.conf.local' > /etc/rspamd/rspamd.conf.local \
-	&& apt-get autoremove --purge \
-	&& apt-get clean \
-	&& mkdir -p /run/rspamd \
-	&& chown _rspamd:_rspamd /run/rspamd
+  ca-certificates \
+  gnupg2 \
+  apt-transport-https \
+  dnsutils \
+  netcat-traditional \
+  wget \
+  redis-tools \
+  procps \
+  nano \
+  lua-cjson \
+  && arch=$(arch | sed s/aarch64/arm64/ | sed s/x86_64/amd64/) \
+  && wget -P /tmp https://rspamd.com/apt-stable/pool/main/r/rspamd/${RSPAMD_VER}~${CODENAME}_${arch}.deb\
+  && apt install -y /tmp/${RSPAMD_VER}~${CODENAME}_${arch}.deb \
+  && rm -rf /var/lib/apt/lists/* /tmp/*\
+  && apt-get autoremove --purge \
+  && apt-get clean \
+  && mkdir -p /run/rspamd \
+  && chown _rspamd:_rspamd /run/rspamd \
+  && echo 'alias ll="ls -la --color"' >> ~/.bashrc \
+  && sed -i 's/#analysis_keyword_table > 0/analysis_cat_table.macro_exist == "M"/g' /usr/share/rspamd/lualib/lua_scanners/oletools.lua
 
 COPY settings.conf /etc/rspamd/settings.conf
+COPY set_worker_password.sh /set_worker_password.sh
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
+
+STOPSIGNAL SIGTERM
 
 CMD ["/usr/bin/rspamd", "-f", "-u", "_rspamd", "-g", "_rspamd"]

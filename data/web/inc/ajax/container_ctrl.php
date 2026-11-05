@@ -1,7 +1,17 @@
 <?php
-session_start();
+
+// Block requests by checking the 'Sec-Fetch-Dest' header.
+if (isset($_SERVER['HTTP_SEC_FETCH_DEST']) && $_SERVER['HTTP_SEC_FETCH_DEST'] !== 'empty') {
+  header('HTTP/1.1 403 Forbidden');
+  exit;
+}
+
 require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/prerequisites.inc.php';
 if (!isset($_SESSION['mailcow_cc_role']) || $_SESSION['mailcow_cc_role'] != 'admin') {
+	exit();
+}
+// Read-only API keys must not control containers
+if (!empty($_SESSION['mailcow_cc_api']) && ($_SESSION['mailcow_cc_api_access'] ?? '') != 'rw') {
 	exit();
 }
 

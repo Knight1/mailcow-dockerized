@@ -1,15 +1,31 @@
 <?php
+require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/lib/vendor/autoload.php';
 require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/vars.inc.php';
-require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/functions.inc.php';
-$default_autodiscover_config = $autodiscover_config;
 if(file_exists('inc/vars.local.inc.php')) {
   include_once 'inc/vars.local.inc.php';
 }
+require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/functions.inc.php';
+require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/functions.auth.inc.php';
+require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/sessions.inc.php';
+require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/functions.mailbox.inc.php';
+require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/functions.ratelimit.inc.php';
+$default_autodiscover_config = $autodiscover_config;
 $autodiscover_config = array_merge($default_autodiscover_config, $autodiscover_config);
 
 // Redis
 $redis = new Redis();
-$redis->connect('redis-mailcow', 6379);
+try {
+  if (!empty(getenv('REDIS_SLAVEOF_IP'))) {
+    $redis->connect(getenv('REDIS_SLAVEOF_IP'), getenv('REDIS_SLAVEOF_PORT'));
+  }
+  else {
+    $redis->connect('redis-mailcow', 6379);
+  }
+  $redis->auth(getenv("REDISPASS"));
+}
+catch (Exception $e) {
+  exit;
+}
 
 error_reporting(0);
 
@@ -27,6 +43,10 @@ if (strpos($data, 'autodiscover/outlook/responseschema') !== false) {
   }
 }
 
+if (getenv('SKIP_SOGO') == "y") {
+  $autodiscover_config['autodiscoverType'] = 'imap';
+}
+
 //$dsn = $database_type . ":host=" . $database_host . ";dbname=" . $database_name;
 $dsn = $database_type . ":unix_socket=" . $database_sock . ";dbname=" . $database_name;
 $opt = [
@@ -35,98 +55,36 @@ $opt = [
   PDO::ATTR_EMULATE_PREPARES   => false,
 ];
 $pdo = new PDO($dsn, $database_user, $database_pass, $opt);
-$login_user = strtolower(trim($_SERVER['PHP_AUTH_USER']));
-$login_pass = trim(htmlspecialchars_decode($_SERVER['PHP_AUTH_PW']));
 
-if (empty($_SERVER['PHP_AUTH_USER']) || empty($_SERVER['PHP_AUTH_PW'])) {
-  $json = json_encode(
-    array(
-      "time" => time(),
-      "ua" => $_SERVER['HTTP_USER_AGENT'],
-      "user" => "none",
-      "service" => "Error: must be authenticated"
-    )
-  );
-  $redis->lPush('AUTODISCOVER_LOG', $json);
-  header('WWW-Authenticate: Basic realm="' . $_SERVER['HTTP_HOST'] . '"');
-  header('HTTP/1.0 401 Unauthorized');
-  exit(0);
-}
+// Init Identity Provider
+$iam_provider = identity_provider('init');
+$iam_settings = identity_provider('get');
 
-$login_role = check_login($login_user, $login_pass);
+// Passwordless autodiscover - no authentication required
+// Email will be extracted from the request body
+$login_user = null;
+$login_role = null;
 
-if ($login_role === "user") {
-  header("Content-Type: application/xml");
-  echo '<?xml version="1.0" encoding="utf-8" ?>' . PHP_EOL;
+header("Content-Type: application/xml");
+echo '<?xml version="1.0" encoding="utf-8" ?>' . PHP_EOL;
 ?>
 <Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006">
 <?php
-  if(!$data) {
-    try {
-      $json = json_encode(
-        array(
-          "time" => time(),
-          "ua" => $_SERVER['HTTP_USER_AGENT'],
-          "user" => $_SERVER['PHP_AUTH_USER'],
-          "service" => "Error: invalid or missing request data"
-        )
-      );
-      $redis->lPush('AUTODISCOVER_LOG', $json);
-      $redis->lTrim('AUTODISCOVER_LOG', 0, 100);
-    }
-    catch (RedisException $e) {
-      $_SESSION['return'][] = array(
-        'type' => 'danger',
-        'msg' => 'Redis: '.$e
-      );
-      return false;
-    }
-    list($usec, $sec) = explode(' ', microtime());
-?>
-  <Response>
-    <Error Time="<?=date('H:i:s', $sec) . substr($usec, 0, strlen($usec) - 2);?>" Id="2477272013">
-      <ErrorCode>600</ErrorCode>
-      <Message>Invalid Request</Message>
-      <DebugData />
-    </Error>
-  </Response>
-</Autodiscover>
-<?php
-    exit(0);
-  }
-  try {
-    $discover = new SimpleXMLElement($data);
-    $email = $discover->Request->EMailAddress;
-  } catch (Exception $e) {
-    $email = $_SERVER['PHP_AUTH_USER'];
-  }
-
-  $username = trim($email);
-  try {
-    $stmt = $pdo->prepare("SELECT `name` FROM `mailbox` WHERE `username`= :username");
-    $stmt->execute(array(':username' => $username));
-    $MailboxData = $stmt->fetch(PDO::FETCH_ASSOC);
-  }
-  catch(PDOException $e) {
-    die("Failed to determine name from SQL");
-  }
-  if (!empty($MailboxData['name'])) {
-    $displayname = $MailboxData['name'];
-  }
-  else {
-    $displayname = $email;
-  }
+if(!$data) {
   try {
     $json = json_encode(
       array(
         "time" => time(),
         "ua" => $_SERVER['HTTP_USER_AGENT'],
-        "user" => $_SERVER['PHP_AUTH_USER'],
-        "service" => $autodiscover_config['autodiscoverType']
+        "user" => "none",
+        "ip" => $_SERVER['REMOTE_ADDR'],
+        "service" => "Error: invalid or missing request data"
       )
     );
     $redis->lPush('AUTODISCOVER_LOG', $json);
     $redis->lTrim('AUTODISCOVER_LOG', 0, 100);
+    $redis->publish("F2B_CHANNEL", "Autodiscover: Invalid request by " . $_SERVER['REMOTE_ADDR']);
+    error_log("Autodiscover: Invalid request by " . $_SERVER['REMOTE_ADDR']);
   }
   catch (RedisException $e) {
     $_SESSION['return'][] = array(
@@ -135,7 +93,142 @@ if ($login_role === "user") {
     );
     return false;
   }
-  if ($autodiscover_config['autodiscoverType'] == 'imap') {
+  list($usec, $sec) = explode(' ', microtime());
+?>
+  <Response>
+    <Error Time="<?=date('H:i:s', $sec) . substr($usec, 0, strlen($usec) - 2);?>" Id="<?=rand(1000000000, 9999999999);?>">
+      <ErrorCode>600</ErrorCode>
+      <Message>Invalid Request</Message>
+      <DebugData />
+    </Error>
+  </Response>
+</Autodiscover>
+<?php
+  exit(0);
+}
+try {
+  $discover = new SimpleXMLElement($data);
+  $email = $discover->Request->EMailAddress;
+} catch (Exception $e) {
+  // If parsing fails, return error
+  try {
+    $json = json_encode(
+      array(
+        "time" => time(),
+        "ua" => $_SERVER['HTTP_USER_AGENT'],
+        "user" => "none",
+        "ip" => $_SERVER['REMOTE_ADDR'],
+        "service" => "Error: could not parse email from request"
+      )
+    );
+    $redis->lPush('AUTODISCOVER_LOG', $json);
+    $redis->lTrim('AUTODISCOVER_LOG', 0, 100);
+    $redis->publish("F2B_CHANNEL", "Autodiscover: Malformed XML by " . $_SERVER['REMOTE_ADDR']);
+    error_log("Autodiscover: Malformed XML by " . $_SERVER['REMOTE_ADDR']);
+  }
+  catch (RedisException $e) {
+    // Silently fail
+  }
+  list($usec, $sec) = explode(' ', microtime());
+?>
+  <Response>
+    <Error Time="<?=date('H:i:s', $sec) . substr($usec, 0, strlen($usec) - 2);?>" Id="<?=rand(1000000000, 9999999999);?>">
+      <ErrorCode>600</ErrorCode>
+      <Message>Invalid Request</Message>
+      <DebugData />
+    </Error>
+  </Response>
+</Autodiscover>
+<?php
+  exit(0);
+}
+
+$username = trim((string)$email);
+if (!filter_var($username, FILTER_VALIDATE_EMAIL)) {
+  try {
+    $json = json_encode(
+      array(
+        "time" => time(),
+        "ua" => $_SERVER['HTTP_USER_AGENT'],
+        "user" => "none",
+        "ip" => $_SERVER['REMOTE_ADDR'],
+        "service" => "Error: invalid email address in request"
+      )
+    );
+    $redis->lPush('AUTODISCOVER_LOG', $json);
+    $redis->lTrim('AUTODISCOVER_LOG', 0, 100);
+    $redis->publish("F2B_CHANNEL", "Autodiscover: Invalid mailbox attempt by " . $_SERVER['REMOTE_ADDR']);
+    error_log("Autodiscover: Invalid mailbox attempt by " . $_SERVER['REMOTE_ADDR']);
+  }
+  catch (RedisException $e) {
+    // Silently fail
+  }
+  list($usec, $sec) = explode(' ', microtime());
+?>
+  <Response>
+    <Error Time="<?=date('H:i:s', $sec) . substr($usec, 0, strlen($usec) - 2);?>" Id="<?=rand(1000000000, 9999999999);?>">
+      <ErrorCode>600</ErrorCode>
+      <Message>Invalid Request</Message>
+      <DebugData />
+    </Error>
+  </Response>
+</Autodiscover>
+<?php
+  exit(0);
+}
+try {
+  $stmt = $pdo->prepare("SELECT `mailbox`.`name`, `mailbox`.`active` FROM `mailbox`
+    INNER JOIN `domain` ON `mailbox`.`domain` = `domain`.`domain`
+    WHERE `mailbox`.`username` = :username
+    AND `mailbox`.`active` = '1'
+    AND `domain`.`active` = '1'");
+  $stmt->execute(array(':username' => $username));
+  $MailboxData = $stmt->fetch(PDO::FETCH_ASSOC);
+}
+catch(PDOException $e) {
+  // Database error - return error response with complete XML
+  list($usec, $sec) = explode(' ', microtime());
+?>
+  <Response>
+    <Error Time="<?=date('H:i:s', $sec) . substr($usec, 0, strlen($usec) - 2);?>" Id="<?=rand(1000000000, 9999999999);?>">
+      <ErrorCode>500</ErrorCode>
+      <Message>Database Error</Message>
+      <DebugData />
+    </Error>
+  </Response>
+</Autodiscover>
+<?php
+  exit(0);
+}
+
+$email = $username;
+$displayname = $email;
+try {
+  $json = json_encode(
+    array(
+      "time" => time(),
+      "ua" => $_SERVER['HTTP_USER_AGENT'],
+      "user" => $email,
+      "ip" => $_SERVER['REMOTE_ADDR'],
+      // The answer is the same, only the log tells unknown or inactive mailboxes apart
+      "service" => (empty($MailboxData)) ? "Error: mailbox not found or inactive" : $autodiscover_config['autodiscoverType']
+    )
+  );
+  $redis->lPush('AUTODISCOVER_LOG', $json);
+  $redis->lTrim('AUTODISCOVER_LOG', 0, 100);
+  if (empty($MailboxData)) {
+    $redis->publish("F2B_CHANNEL", "Autodiscover: Invalid mailbox attempt by " . $_SERVER['REMOTE_ADDR']);
+    error_log("Autodiscover: Invalid mailbox attempt by " . $_SERVER['REMOTE_ADDR']);
+  }
+}
+catch (RedisException $e) {
+  $_SESSION['return'][] = array(
+    'type' => 'danger',
+    'msg' => 'Redis: '.$e
+  );
+  return false;
+}
+if ($autodiscover_config['autodiscoverType'] == 'imap') {
 ?>
   <Response xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a">
     <User>
@@ -149,7 +242,7 @@ if ($login_role === "user") {
         <Server><?=$autodiscover_config['imap']['server'];?></Server>
         <Port><?=$autodiscover_config['imap']['port'];?></Port>
         <DomainRequired>off</DomainRequired>
-        <LoginName><?=$email;?></LoginName>
+        <LoginName><?=htmlspecialchars($email, ENT_XML1 | ENT_QUOTES, 'UTF-8');?></LoginName>
         <SPA>off</SPA>
         <SSL>on</SSL>
         <AuthRequired>on</AuthRequired>
@@ -159,25 +252,31 @@ if ($login_role === "user") {
         <Server><?=$autodiscover_config['smtp']['server'];?></Server>
         <Port><?=$autodiscover_config['smtp']['port'];?></Port>
         <DomainRequired>off</DomainRequired>
-        <LoginName><?=$email;?></LoginName>
+        <LoginName><?=htmlspecialchars($email, ENT_XML1 | ENT_QUOTES, 'UTF-8');?></LoginName>
         <SPA>off</SPA>
         <SSL>on</SSL>
         <AuthRequired>on</AuthRequired>
         <UsePOPAuth>on</UsePOPAuth>
         <SMTPLast>off</SMTPLast>
       </Protocol>
+    <?php
+    if (getenv('SKIP_SOGO') != "y") {
+    ?>
       <Protocol>
         <Type>CalDAV</Type>
-        <Server>https://<?=$autodiscover_config['caldav']['server'];?><?php if ($autodiscover_config['caldav']['port'] != 443) echo ':'.$autodiscover_config['caldav']['port']; ?>/SOGo/dav/<?=$email;?>/</Server>
+        <Server>https://<?=$autodiscover_config['caldav']['server'];?><?php if ($autodiscover_config['caldav']['port'] != 443) echo ':'.$autodiscover_config['caldav']['port']; ?>/SOGo/dav/<?=htmlspecialchars($email, ENT_XML1 | ENT_QUOTES, 'UTF-8');?>/</Server>
         <DomainRequired>off</DomainRequired>
-        <LoginName><?=$email;?></LoginName>
+        <LoginName><?=htmlspecialchars($email, ENT_XML1 | ENT_QUOTES, 'UTF-8');?></LoginName>
       </Protocol>
       <Protocol>
         <Type>CardDAV</Type>
-        <Server>https://<?=$autodiscover_config['carddav']['server'];?><?php if ($autodiscover_config['caldav']['port'] != 443) echo ':'.$autodiscover_config['carddav']['port']; ?>/SOGo/dav/<?=$email;?>/</Server>
+        <Server>https://<?=$autodiscover_config['carddav']['server'];?><?php if ($autodiscover_config['caldav']['port'] != 443) echo ':'.$autodiscover_config['carddav']['port']; ?>/SOGo/dav/<?=htmlspecialchars($email, ENT_XML1 | ENT_QUOTES, 'UTF-8');?>/</Server>
         <DomainRequired>off</DomainRequired>
-        <LoginName><?=$email;?></LoginName>
+        <LoginName><?=htmlspecialchars($email, ENT_XML1 | ENT_QUOTES, 'UTF-8');?></LoginName>
       </Protocol>
+    <?php
+    }
+    ?>
     </Account>
   </Response>
 <?php
@@ -188,7 +287,7 @@ if ($login_role === "user") {
     <Culture>en:en</Culture>
     <User>
       <DisplayName><?=htmlspecialchars($displayname, ENT_XML1 | ENT_QUOTES, 'UTF-8');?></DisplayName>
-      <EMailAddress><?=$email;?></EMailAddress>
+      <EMailAddress><?=htmlspecialchars($email, ENT_XML1 | ENT_QUOTES, 'UTF-8');?></EMailAddress>
     </User>
     <Action>
       <Settings>
@@ -204,6 +303,3 @@ if ($login_role === "user") {
   }
 ?>
 </Autodiscover>
-<?php
-}
-?>

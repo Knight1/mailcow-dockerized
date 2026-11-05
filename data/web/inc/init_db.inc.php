@@ -1,40 +1,71 @@
 <?php
-function init_db_schema() {
+function init_db_schema()
+{
   try {
     global $pdo;
 
-    $db_version = "07102018_1502";
+    // Defined once as DB_VERSION in docker-compose.yml
+    $db_version = (string)getenv('DB_VERSION');
+    if ($db_version === '') {
+      if (php_sapi_name() == "cli") {
+        echo "DB initialization failed: DB_VERSION is not set" . PHP_EOL;
+      } else {
+        $_SESSION['return'][] = array(
+          'type' => 'danger',
+          'log' => array(__FUNCTION__),
+          'msg' => 'Database not initialized: DB_VERSION is not set.'
+        );
+      }
+      return false;
+    }
 
     $stmt = $pdo->query("SHOW TABLES LIKE 'versions'");
     $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
     if ($num_results != 0) {
-      $stmt = $pdo->query("SELECT `version` FROM `versions`");
+      $stmt = $pdo->query("SELECT `version` FROM `versions` WHERE `application` = 'db_schema'");
       if ($stmt->fetch(PDO::FETCH_ASSOC)['version'] == $db_version) {
+        return true;
+      }
+      if (!preg_match('/y|yes/i', getenv('MASTER'))) {
+        $_SESSION['return'][] = array(
+          'type' => 'warning',
+          'log' => array(__FUNCTION__),
+          'msg' => 'Database not initialized: not running db_init on slave.'
+        );
         return true;
       }
     }
 
     $views = array(
-    "grouped_mail_aliases" => "CREATE VIEW grouped_mail_aliases (username, aliases) AS
-      SELECT goto, IFNULL(GROUP_CONCAT(address SEPARATOR ' '), '') AS address FROM alias
-      WHERE address!=goto
-      AND active = '1'
-      AND address NOT LIKE '@%'
-      GROUP BY goto;",
-    "grouped_sender_acl" => "CREATE VIEW grouped_sender_acl (username, send_as_acl) AS
-      SELECT logged_in_as, IFNULL(GROUP_CONCAT(send_as SEPARATOR ' '), '') AS send_as_acl FROM sender_acl
-      WHERE send_as NOT LIKE '@%'
-      GROUP BY logged_in_as;",
-    "grouped_domain_alias_address" => "CREATE VIEW grouped_domain_alias_address (username, ad_alias) AS
-      SELECT username, IFNULL(GROUP_CONCAT(local_part, '@', alias_domain SEPARATOR ' '), '') AS ad_alias FROM mailbox
-      LEFT OUTER JOIN alias_domain ON target_domain=domain
-      GROUP BY username;",
-    "sieve_before" => "CREATE VIEW sieve_before (id, username, script_name, script_data) AS
-      SELECT md5(script_data), username, script_name, script_data FROM sieve_filters
-      WHERE filter_type = 'prefilter';",
-    "sieve_after" => "CREATE VIEW sieve_after (id, username, script_name, script_data) AS
-      SELECT md5(script_data), username, script_name, script_data FROM sieve_filters
-      WHERE filter_type = 'postfilter';"
+      "grouped_mail_aliases" => "CREATE VIEW grouped_mail_aliases (username, aliases) AS
+        SELECT goto, IFNULL(GROUP_CONCAT(address ORDER BY address SEPARATOR ' '), '') AS address FROM alias
+        WHERE address!=goto
+        AND active = '1'
+        AND sogo_visible = '1'
+        AND address NOT LIKE '@%'
+        GROUP BY goto;",
+      // START
+      // Unused at the moment - we cannot allow to show a foreign mailbox as sender address in SOGo, as SOGo does not like this
+      // We need to create delegation in SOGo AND set a sender_acl in mailcow to allow to send as user X
+      "grouped_sender_acl" => "CREATE VIEW grouped_sender_acl (username, send_as_acl) AS
+        SELECT logged_in_as, IFNULL(GROUP_CONCAT(send_as SEPARATOR ' '), '') AS send_as_acl FROM sender_acl
+        WHERE send_as NOT LIKE '@%'
+        GROUP BY logged_in_as;",
+      // END
+      "grouped_sender_acl_external" => "CREATE VIEW grouped_sender_acl_external (username, send_as_acl) AS
+        SELECT logged_in_as, IFNULL(GROUP_CONCAT(send_as SEPARATOR ' '), '') AS send_as_acl FROM sender_acl
+        WHERE send_as NOT LIKE '@%' AND external = '1'
+        GROUP BY logged_in_as;",
+      "grouped_domain_alias_address" => "CREATE VIEW grouped_domain_alias_address (username, ad_alias) AS
+        SELECT username, IFNULL(GROUP_CONCAT(local_part, '@', alias_domain SEPARATOR ' '), '') AS ad_alias FROM mailbox
+        LEFT OUTER JOIN alias_domain ON target_domain=domain
+        GROUP BY username;",
+      "sieve_before" => "CREATE VIEW sieve_before (id, username, script_name, script_data) AS
+        SELECT md5(script_data), username, script_name, script_data FROM sieve_filters
+        WHERE filter_type = 'prefilter';",
+      "sieve_after" => "CREATE VIEW sieve_after (id, username, script_name, script_data) AS
+        SELECT md5(script_data), username, script_name, script_data FROM sieve_filters
+        WHERE filter_type = 'postfilter';"
     );
 
     $tables = array(
@@ -58,12 +89,33 @@ function init_db_schema() {
           "superadmin" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
           "modified" => "DATETIME ON UPDATE NOW(0)",
-          "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
+          "active" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "attributes" => "JSON"
         ),
         "keys" => array(
           "primary" => array(
             "" => array("username")
           )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "fido2" => array(
+        "cols" => array(
+          "username" => "VARCHAR(255) NOT NULL",
+          "friendlyName" => "VARCHAR(255)",
+          "rpId" => "VARCHAR(255) NOT NULL",
+          "credentialPublicKey" => "TEXT NOT NULL",
+          "certificateChain" => "TEXT",
+          // Can be null for format "none"
+          "certificate" => "TEXT",
+          "certificateIssuer" => "VARCHAR(255)",
+          "certificateSubject" => "VARCHAR(255)",
+          "signatureCounter" => "INT",
+          "AAGUID" => "BLOB",
+          "credentialId" => "BLOB NOT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE NOW(0)",
+          "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
       ),
@@ -74,11 +126,15 @@ function init_db_schema() {
           "c_name" => "VARCHAR(255) NOT NULL",
           "c_password" => "VARCHAR(255) NOT NULL DEFAULT ''",
           "c_cn" => "VARCHAR(255)",
+          "c_l" => "VARCHAR(255)",
+          "c_o" => "VARCHAR(255)",
+          "c_ou" => "VARCHAR(255)",
+          "c_telephonenumber" => "VARCHAR(255)",
           "mail" => "VARCHAR(255) NOT NULL",
           // TODO -> use TEXT and check if SOGo login breaks on empty aliases
           "aliases" => "TEXT NOT NULL",
           "ad_aliases" => "VARCHAR(6144) NOT NULL DEFAULT ''",
-          "home" => "VARCHAR(255)",
+          "ext_acl" => "VARCHAR(6144) NOT NULL DEFAULT ''",
           "kind" => "VARCHAR(100) NOT NULL DEFAULT ''",
           "multiple_bookings" => "INT NOT NULL DEFAULT -1"
         ),
@@ -110,14 +166,39 @@ function init_db_schema() {
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
       ),
-      "alias" => array(
+      "transports" => array(
         "cols" => array(
           "id" => "INT NOT NULL AUTO_INCREMENT",
-          "address" => "VARCHAR(255) NOT NULL",
-          "goto" => "TEXT NOT NULL",
-          "domain" => "VARCHAR(255) NOT NULL",
+          "destination" => "VARCHAR(255) NOT NULL",
+          "nexthop" => "VARCHAR(255) NOT NULL",
+          "username" => "VARCHAR(255) NOT NULL DEFAULT ''",
+          "password" => "VARCHAR(255) NOT NULL DEFAULT ''",
+          "is_mx_based" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("id")
+          ),
+          "key" => array(
+            "destination" => array("destination"),
+            "nexthop" => array("nexthop"),
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "api" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "api_key" => "VARCHAR(255) NOT NULL",
+          "description" => "VARCHAR(255) NOT NULL DEFAULT ''",
+          "allow_from" => "VARCHAR(512) NOT NULL",
+          "skip_ip_check" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
-          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP",
+          "modified" => "DATETIME ON UPDATE NOW(0)",
+          "access" => "ENUM('ro', 'rw') NOT NULL DEFAULT 'rw'",
+          // 1 = defined in mailcow.conf, read-only in UI and API
+          "service" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
         ),
         "keys" => array(
@@ -125,34 +206,19 @@ function init_db_schema() {
             "" => array("id")
           ),
           "unique" => array(
-            "address" => array("address")
-          ),
-          "key" => array(
-            "domain" => array("domain")
+            "api_key" => array("api_key")
           )
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
       ),
-      "api" => array(
-        "cols" => array(
-          "api_key" => "VARCHAR(255) NOT NULL",
-          "allow_from" => "VARCHAR(512) NOT NULL",
-          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
-          "modified" => "DATETIME ON UPDATE NOW(0)",
-          "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
-        ),
-        "keys" => array(
-          "primary" => array(
-            "" => array("api_key")
-          ),
-        ),
-        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
-      ),
-      "sender_acl" => array(
+      "templates" => array(
         "cols" => array(
           "id" => "INT NOT NULL AUTO_INCREMENT",
-          "logged_in_as" => "VARCHAR(255) NOT NULL",
-          "send_as" => "VARCHAR(255) NOT NULL"
+          "template" => "VARCHAR(255) NOT NULL",
+          "type" => "VARCHAR(255) NOT NULL",
+          "attributes" => "JSON",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP"
         ),
         "keys" => array(
           "primary" => array(
@@ -162,16 +228,20 @@ function init_db_schema() {
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
       ),
       "domain" => array(
+        // Todo: Move some attributes to json
         "cols" => array(
           "domain" => "VARCHAR(255) NOT NULL",
           "description" => "VARCHAR(255)",
           "aliases" => "INT(10) NOT NULL DEFAULT '0'",
           "mailboxes" => "INT(10) NOT NULL DEFAULT '0'",
-          "maxquota" => "BIGINT(20) NOT NULL DEFAULT '0'",
+          "defquota" => "BIGINT(20) NOT NULL DEFAULT '3072'",
+          "maxquota" => "BIGINT(20) NOT NULL DEFAULT '102400'",
           "quota" => "BIGINT(20) NOT NULL DEFAULT '102400'",
           "relayhost" => "VARCHAR(255) NOT NULL DEFAULT '0'",
           "backupmx" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "gal" => "TINYINT(1) NOT NULL DEFAULT '1'",
           "relay_all_recipients" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "relay_unknown_only" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
           "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP",
           "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
@@ -179,6 +249,42 @@ function init_db_schema() {
         "keys" => array(
           "primary" => array(
             "" => array("domain")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "domain_wide_footer" => array(
+        "cols" => array(
+          "domain" => "VARCHAR(255) NOT NULL",
+          "html" => "LONGTEXT",
+          "plain" => "LONGTEXT",
+          "mbox_exclude" => "JSON NOT NULL DEFAULT ('[]')",
+          "alias_domain_exclude" => "JSON NOT NULL DEFAULT ('[]')",
+          "skip_replies" => "TINYINT(1) NOT NULL DEFAULT '0'"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("domain")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "tags_domain" => array(
+        "cols" => array(
+          "tag_name" => "VARCHAR(255) NOT NULL",
+          "domain" => "VARCHAR(255) NOT NULL"
+        ),
+        "keys" => array(
+          "fkey" => array(
+            "fk_tags_domain" => array(
+              "col" => "domain",
+              "ref" => "domain.domain",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          ),
+          "unique" => array(
+            "tag_name" => array("tag_name", "domain")
           )
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
@@ -207,20 +313,27 @@ function init_db_schema() {
         "cols" => array(
           "id" => "INT NOT NULL AUTO_INCREMENT",
           "qid" => "VARCHAR(30) NOT NULL",
+          "subject" => "VARCHAR(500)",
           "score" => "FLOAT(8,2)",
-          "ip" => "VARBINARY(16)",
+          "ip" => "VARCHAR(50)",
           "action" => "CHAR(20) NOT NULL DEFAULT 'unknown'",
           "symbols" => "JSON",
+          "fuzzy_hashes" => "JSON",
           "sender" => "VARCHAR(255) NOT NULL DEFAULT 'unknown'",
           "rcpt" => "VARCHAR(255)",
           "msg" => "LONGTEXT",
           "domain" => "VARCHAR(255)",
+          "notified" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
           "user" => "VARCHAR(255) NOT NULL DEFAULT 'unknown'",
+          "qhash" => "VARCHAR(64)",
         ),
         "keys" => array(
           "primary" => array(
             "" => array("id")
+          ),
+          "key" => array(
+            "qhash" => array("qhash")
           )
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
@@ -230,13 +343,17 @@ function init_db_schema() {
           "username" => "VARCHAR(255) NOT NULL",
           "password" => "VARCHAR(255) NOT NULL",
           "name" => "VARCHAR(255)",
-          "maildir" => "VARCHAR(255) NOT NULL",
+          "description" => "VARCHAR(255)",
+          // mailbox_path_prefix is followed by domain/local_part/
+          "mailbox_path_prefix" => "VARCHAR(150) DEFAULT '/var/vmail/'",
           "quota" => "BIGINT(20) NOT NULL DEFAULT '102400'",
           "local_part" => "VARCHAR(255) NOT NULL",
           "domain" => "VARCHAR(255) NOT NULL",
           "attributes" => "JSON",
+          "custom_attributes" => "JSON NOT NULL DEFAULT ('{}')",
           "kind" => "VARCHAR(100) NOT NULL DEFAULT ''",
           "multiple_bookings" => "INT NOT NULL DEFAULT -1",
+          "authsource" => "ENUM('mailcow', 'keycloak', 'generic-oidc', 'ldap') DEFAULT 'mailcow'",
           "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
           "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP",
           "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
@@ -246,7 +363,382 @@ function init_db_schema() {
             "" => array("username")
           ),
           "key" => array(
+            "domain" => array("domain"),
+            "kind" => array("kind")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "tags_mailbox" => array(
+        "cols" => array(
+          "tag_name" => "VARCHAR(255) NOT NULL",
+          "username" => "VARCHAR(255) NOT NULL"
+        ),
+        "keys" => array(
+          "fkey" => array(
+            "fk_tags_mailbox" => array(
+              "col" => "username",
+              "ref" => "mailbox.username",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          ),
+          "unique" => array(
+            "tag_name" => array("tag_name", "username")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "mailbox_group" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "domain" => "VARCHAR(255) NOT NULL",
+          "name" => "VARCHAR(100) NOT NULL",
+          "description" => "VARCHAR(255) NOT NULL DEFAULT ''",
+          // distribution address, maintained as alias row with group_id
+          "address" => "VARCHAR(255) NULL DEFAULT NULL",
+          // members may send as the address
+          "sender_allowed" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "sogo_visible" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "internal" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "template_id" => "INT NULL DEFAULT NULL",
+          // highest priority wins when a mailbox is in several groups with a template
+          "priority" => "INT NOT NULL DEFAULT '0'",
+          // IdP group id: set = memberships are synced from the IdP
+          "idp_ref" => "VARCHAR(255) NULL DEFAULT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP",
+          "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("id")
+          ),
+          "unique" => array(
+            "domain_name" => array("domain", "name"),
+            "address" => array("address"),
+            "idp_ref" => array("idp_ref")
+          ),
+          "fkey" => array(
+            "fk_mailbox_group_domain" => array(
+              "col" => "domain",
+              "ref" => "domain.domain",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            ),
+            "fk_mailbox_group_template" => array(
+              "col" => "template_id",
+              "ref" => "templates.id",
+              "delete" => "SET NULL",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "mailbox_group_member" => array(
+        "cols" => array(
+          "group_id" => "INT NOT NULL",
+          "username" => "VARCHAR(255) NOT NULL",
+          "source" => "ENUM('manual', 'idp') NOT NULL DEFAULT 'manual'",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("group_id", "username")
+          ),
+          "key" => array(
+            "username" => array("username")
+          ),
+          "fkey" => array(
+            "fk_mailbox_group_member_group" => array(
+              "col" => "group_id",
+              "ref" => "mailbox_group.id",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            ),
+            "fk_mailbox_group_member_mailbox" => array(
+              "col" => "username",
+              "ref" => "mailbox.username",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "mailbox_group_send_as" => array(
+        "cols" => array(
+          "group_id" => "INT NOT NULL",
+          // address or @domain the members may send as
+          "address" => "VARCHAR(255) NOT NULL"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("group_id", "address")
+          ),
+          "key" => array(
+            "address" => array("address")
+          ),
+          "fkey" => array(
+            "fk_mailbox_group_send_as_group" => array(
+              "col" => "group_id",
+              "ref" => "mailbox_group.id",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "mailbox_group_imap_grant" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "group_id" => "INT NOT NULL",
+          // mailbox whose folders the members may access
+          "owner" => "VARCHAR(255) NOT NULL",
+          "rights" => "ENUM('read', 'write', 'full') NOT NULL DEFAULT 'read'",
+          // 1 = the group-grants cron subscribes the members to the folders (once per member)
+          "subscribe" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          // removing = the ACL is deleted in Dovecot, then the row
+          "state" => "ENUM('pending', 'applied', 'failed', 'removing') NOT NULL DEFAULT 'pending'",
+          "last_error" => "TEXT",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("id")
+          ),
+          "unique" => array(
+            "group_owner" => array("group_id", "owner")
+          ),
+          "key" => array(
+            "owner" => array("owner")
+          ),
+          "fkey" => array(
+            "fk_mailbox_group_imap_grant_group" => array(
+              "col" => "group_id",
+              "ref" => "mailbox_group.id",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            ),
+            "fk_mailbox_group_imap_grant_owner" => array(
+              "col" => "owner",
+              "ref" => "mailbox.username",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "mailbox_group_sogo_grant" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "group_id" => "INT NOT NULL",
+          "owner" => "VARCHAR(255) NOT NULL",
+          "folder_type" => "ENUM('Calendar', 'Contacts') NOT NULL DEFAULT 'Calendar'",
+          "folder" => "VARCHAR(255) NOT NULL DEFAULT 'personal'",
+          "access" => "ENUM('read', 'write') NOT NULL DEFAULT 'read'",
+          // 1 = the group-grants cron subscribes the members to the folder (once per member)
+          "subscribe" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          // pending = the owner has not opened SOGo yet, the folder does not exist
+          "state" => "ENUM('pending', 'applied', 'failed') NOT NULL DEFAULT 'pending'",
+          "last_error" => "TEXT",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("id")
+          ),
+          "unique" => array(
+            "group_folder" => array("group_id", "owner", "folder_type", "folder")
+          ),
+          "key" => array(
+            "owner" => array("owner")
+          ),
+          "fkey" => array(
+            "fk_mailbox_group_sogo_grant_group" => array(
+              "col" => "group_id",
+              "ref" => "mailbox_group.id",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            ),
+            "fk_mailbox_group_sogo_grant_owner" => array(
+              "col" => "owner",
+              "ref" => "mailbox.username",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      // sogo_acl rows written for a grant, so only those are ever removed again. No FK: rows of grants
+      // removed by a cascade stay until their sogo_acl rows are deleted (GroupRepository::cleanupSogoAcl())
+      "mailbox_group_sogo_acl" => array(
+        "cols" => array(
+          "acl_id" => "INT NOT NULL",
+          "grant_id" => "INT NOT NULL",
+          "c_uid" => "VARCHAR(255) NOT NULL",
+          "c_role" => "VARCHAR(80) NOT NULL"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("acl_id")
+          ),
+          "key" => array(
+            "grant_id" => array("grant_id")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      // IMAP and SOGo subscriptions made by the group-grants cron. No FK: rows of grants removed by a cascade stay
+      // until the members are unsubscribed again
+      "mailbox_group_subscription" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "kind" => "ENUM('imap', 'sogo') NOT NULL",
+          // mailbox_group_imap_grant.id or mailbox_group_sogo_grant.id
+          "grant_id" => "INT NOT NULL",
+          "username" => "VARCHAR(255) NOT NULL",
+          "owner" => "VARCHAR(255) NOT NULL",
+          // SOGo: Calendar/<id> or Contacts/<id>, IMAP: empty (all folders of the owner)
+          "folder" => "VARCHAR(255) NOT NULL DEFAULT ''",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("id")
+          ),
+          "unique" => array(
+            "grant_username" => array("kind", "grant_id", "username")
+          ),
+          "key" => array(
+            "username" => array("username")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "identity_link" => array(
+        "cols" => array(
+          "username" => "VARCHAR(255) NOT NULL",
+          "provider" => "VARCHAR(20) NOT NULL",
+          // Keycloak user id (= OIDC sub), LDAP objectGUID/entryUUID/... or dn:<dn>, OIDC sub; NULL = not linked yet
+          "external_id" => "VARCHAR(255) NULL DEFAULT NULL",
+          // 1 = the sync set the mailbox to login disabled (active = 2)
+          "idp_disabled" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          // first complete sync run that did not list the user
+          "missing_since" => "DATETIME NULL DEFAULT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("username")
+          ),
+          "unique" => array(
+            "provider_external_id" => array("provider", "external_id")
+          ),
+          "fkey" => array(
+            "fk_identity_link_mailbox" => array(
+              "col" => "username",
+              "ref" => "mailbox.username",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "identity_sync_run" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "provider" => "VARCHAR(20) NOT NULL DEFAULT ''",
+          // run = scheduled or requested, preview = dry run, force = without the deactivation limit
+          "mode" => "ENUM('run', 'preview', 'force') NOT NULL DEFAULT 'run'",
+          "status" => "ENUM('pending', 'running', 'ok', 'blocked', 'error') NOT NULL DEFAULT 'pending'",
+          "requested_by" => "VARCHAR(255) NOT NULL DEFAULT ''",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "started" => "DATETIME NULL DEFAULT NULL",
+          "finished" => "DATETIME NULL DEFAULT NULL",
+          "summary" => "MEDIUMTEXT"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("id")
+          ),
+          "key" => array(
+            "status" => array("status")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      // alias and sender_acl come after mailbox_group (foreign keys)
+      "alias" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "address" => "VARCHAR(255) NOT NULL",
+          "goto" => "TEXT NOT NULL",
+          "domain" => "VARCHAR(255) NOT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP",
+          "private_comment" => "TEXT",
+          "public_comment" => "TEXT",
+          "sogo_visible" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "internal" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "sender_allowed" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "active" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          // set = distribution address of a mailbox group, read-only in the alias UI
+          "group_id" => "INT NULL DEFAULT NULL"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("id")
+          ),
+          "unique" => array(
+            "address" => array("address"),
+            "group_id" => array("group_id")
+          ),
+          "key" => array(
             "domain" => array("domain")
+          ),
+          "fkey" => array(
+            "fk_alias_mailbox_group" => array(
+              "col" => "group_id",
+              "ref" => "mailbox_group.id",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "sender_acl" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "logged_in_as" => "VARCHAR(255) NOT NULL",
+          "send_as" => "VARCHAR(255) NOT NULL",
+          "external" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          // set = granted through a mailbox group, rebuilt by the group module
+          "group_id" => "INT NULL DEFAULT NULL"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("id")
+          ),
+          "key" => array(
+            "group_id" => array("group_id")
+          ),
+          "fkey" => array(
+            "fk_sender_acl_mailbox_group" => array(
+              "col" => "group_id",
+              "ref" => "mailbox_group.id",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
           )
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
@@ -281,6 +773,60 @@ function init_db_schema() {
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
       ),
+      "app_passwd" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "name" => "VARCHAR(255) NOT NULL",
+          "mailbox" => "VARCHAR(255) NOT NULL",
+          "domain" => "VARCHAR(255) NOT NULL",
+          "password" => "VARCHAR(255) NOT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP",
+          "imap_access" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "smtp_access" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "dav_access" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "eas_access" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "pop3_access" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "sieve_access" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("id")
+          ),
+          "key" => array(
+            "mailbox" => array("mailbox"),
+            "password" => array("password"),
+            "domain" => array("domain"),
+          ),
+          "fkey" => array(
+            "fk_username_app_passwd" => array(
+              "col" => "mailbox",
+              "ref" => "mailbox.username",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "mta_sts" => array(
+        "cols" => array(
+          "id" => "BIGINT NOT NULL",
+          "domain" => "VARCHAR(255) NOT NULL",
+          "version" => "VARCHAR(255) NOT NULL",
+          "mode" => "VARCHAR(255) NOT NULL",
+          "mx" => "VARCHAR(255) NOT NULL",
+          "max_age" => "VARCHAR(255) NOT NULL",
+          "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("domain")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
       "user_acl" => array(
         "cols" => array(
           "username" => "VARCHAR(255) NOT NULL",
@@ -289,10 +835,18 @@ function init_db_schema() {
           "spam_score" => "TINYINT(1) NOT NULL DEFAULT '1'",
           "spam_policy" => "TINYINT(1) NOT NULL DEFAULT '1'",
           "delimiter_action" => "TINYINT(1) NOT NULL DEFAULT '1'",
-          "syncjobs" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "syncjobs" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "eas_reset" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "sogo_profile_reset" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "pushover" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          // quarantine is for quarantine actions, todo: rename
           "quarantine" => "TINYINT(1) NOT NULL DEFAULT '1'",
-          ),
+          "quarantine_attachments" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "quarantine_notification" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "quarantine_category" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "app_passwds" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "pw_reset" => "TINYINT(1) NOT NULL DEFAULT '1'",
+        ),
         "keys" => array(
           "primary" => array(
             "" => array("username")
@@ -331,7 +885,11 @@ function init_db_schema() {
         "cols" => array(
           "address" => "VARCHAR(255) NOT NULL",
           "goto" => "TEXT NOT NULL",
-          "validity" => "INT(11) NOT NULL"
+          "description" => "TEXT NOT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP",
+          "validity" => "INT(11)",
+          "permanent" => "TINYINT(1) NOT NULL DEFAULT '0'"
         ),
         "keys" => array(
           "primary" => array(
@@ -375,6 +933,20 @@ function init_db_schema() {
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
       ),
+      "identity_provider" => array(
+        "cols" => array(
+          "key" => "VARCHAR(255) NOT NULL",
+          "value" => "TEXT NOT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("key")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
       "logs" => array(
         "cols" => array(
           "id" => "INT NOT NULL AUTO_INCREMENT",
@@ -394,7 +966,41 @@ function init_db_schema() {
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
       ),
+      "sasl_log" => array(
+        "cols" => array(
+          "service" => "VARCHAR(32) NOT NULL DEFAULT ''",
+          "app_password" => "INT",
+          "username" => "VARCHAR(255) NOT NULL",
+          "real_rip" => "VARCHAR(64) NOT NULL",
+          "datetime" => "DATETIME(0) NOT NULL DEFAULT NOW(0)"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("service", "real_rip", "username")
+          ),
+          "key" => array(
+            "username" => array("username"),
+            "service" => array("service"),
+            "datetime" => array("datetime"),
+            "real_rip" => array("real_rip")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
       "quota2" => array(
+        "cols" => array(
+          "username" => "VARCHAR(255) NOT NULL",
+          "bytes" => "BIGINT(20) NOT NULL DEFAULT '0'",
+          "messages" => "BIGINT(20) NOT NULL DEFAULT '0'"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("username")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "quota2replica" => array(
         "cols" => array(
           "username" => "VARCHAR(255) NOT NULL",
           "bytes" => "BIGINT(20) NOT NULL DEFAULT '0'",
@@ -431,14 +1037,172 @@ function init_db_schema() {
           "syncjobs" => "TINYINT(1) NOT NULL DEFAULT '1'",
           "quarantine" => "TINYINT(1) NOT NULL DEFAULT '1'",
           "login_as" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "sogo_access" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "app_passwds" => "TINYINT(1) NOT NULL DEFAULT '1'",
           "bcc_maps" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "pushover" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "filters" => "TINYINT(1) NOT NULL DEFAULT '1'",
           "ratelimit" => "TINYINT(1) NOT NULL DEFAULT '1'",
           "spam_policy" => "TINYINT(1) NOT NULL DEFAULT '1'",
-          ),
+          "extend_sender_acl" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "unlimited_quota" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "protocol_access" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "smtp_ip_access" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "alias_domains" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "mailbox_relayhost" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "domain_relayhost" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "domain_desc" => "TINYINT(1) NOT NULL DEFAULT '0'",
+          "alias_external_goto" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "mailbox_groups" => "TINYINT(1) NOT NULL DEFAULT '1'"
+        ),
         "keys" => array(
           "primary" => array(
             "" => array("username")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "da_sso" => array(
+        "cols" => array(
+          "username" => "VARCHAR(255) NOT NULL",
+          "token" => "VARCHAR(255) NOT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("token", "created")
+          ),
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "reset_password" => array(
+        "cols" => array(
+          "username" => "VARCHAR(255) NOT NULL",
+          "token" => "VARCHAR(255) NOT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("token", "created")
+          ),
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "imapsync_source" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "name" => "VARCHAR(100) NOT NULL",
+          "description" => "VARCHAR(255) NOT NULL DEFAULT ''",
+          "created_by" => "VARCHAR(255) NOT NULL DEFAULT ''",
+          "scope" => "ENUM('all','domain','user') NOT NULL DEFAULT 'user'",
+          "host1" => "VARCHAR(255) NOT NULL",
+          "port1" => "SMALLINT UNSIGNED NOT NULL",
+          "enc1" => "ENUM('TLS','SSL','PLAIN') DEFAULT 'TLS'",
+          "verify_cert" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "auth_type" => "ENUM('PLAIN','LOGIN','CRAM-MD5','XOAUTH2') DEFAULT 'PLAIN'",
+          "oauth_flow" => "ENUM('client_credentials','authorization_code') NOT NULL DEFAULT 'client_credentials'",
+          "oauth_token_endpoint" => "VARCHAR(500) DEFAULT NULL",
+          "oauth_authorize_endpoint" => "VARCHAR(500) DEFAULT NULL",
+          "oauth_userinfo_endpoint" => "VARCHAR(500) DEFAULT NULL",
+          "oauth_client_id" => "VARCHAR(500) DEFAULT NULL",
+          "oauth_client_secret" => "VARCHAR(500) DEFAULT NULL",
+          "oauth_scope" => "VARCHAR(500) DEFAULT NULL",
+          "oauth_extra_params" => "TEXT DEFAULT NULL",
+          "oauth_access_token" => "TEXT DEFAULT NULL",
+          "oauth_token_expires" => "BIGINT UNSIGNED DEFAULT NULL",
+          "oauth_last_refresh_error" => "TEXT DEFAULT NULL",
+          "oauth_last_refresh_attempt" => "DATETIME NULL DEFAULT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP",
+          "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("id")
+          ),
+          "unique" => array(
+            "uniq_creator_name" => array("created_by", "name")
+          ),
+          "key" => array(
+            "idx_created_by" => array("created_by"),
+            "idx_scope" => array("scope")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "imapsync_source_domain" => array(
+        "cols" => array(
+          "source_id" => "INT NOT NULL",
+          "domain" => "VARCHAR(255) NOT NULL"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("source_id", "domain")
+          ),
+          "key" => array(
+            "idx_domain" => array("domain")
+          ),
+          "fkey" => array(
+            "fk_imapsync_source_domain" => array(
+              "col" => "source_id",
+              "ref" => "imapsync_source.id",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "imapsync_source_user" => array(
+        "cols" => array(
+          "source_id" => "INT NOT NULL",
+          "username" => "VARCHAR(255) NOT NULL"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("source_id", "username")
+          ),
+          "key" => array(
+            "idx_username" => array("username")
+          ),
+          "fkey" => array(
+            "fk_imapsync_source_user" => array(
+              "col" => "source_id",
+              "ref" => "imapsync_source.id",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "imapsync_source_oauth_token" => array(
+        "cols" => array(
+          "source_id" => "INT NOT NULL",
+          "owner" => "VARCHAR(255) NOT NULL",
+          "username" => "VARCHAR(255) NOT NULL",
+          "access_token" => "TEXT DEFAULT NULL",
+          "refresh_token" => "TEXT DEFAULT NULL",
+          "token_expires" => "BIGINT UNSIGNED DEFAULT NULL",
+          "last_refresh_error" => "TEXT DEFAULT NULL",
+          "oauth_last_refresh_attempt" => "DATETIME NULL DEFAULT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("source_id", "owner", "username")
+          ),
+          "key" => array(
+            "idx_owner" => array("owner")
+          ),
+          "fkey" => array(
+            "fk_imapsync_source_oauth_token" => array(
+              "col" => "source_id",
+              "ref" => "imapsync_source.id",
+              "delete" => "CASCADE",
+              "update" => "NO ACTION"
+            )
           )
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
@@ -447,32 +1211,35 @@ function init_db_schema() {
         "cols" => array(
           "id" => "INT NOT NULL AUTO_INCREMENT",
           "user2" => "VARCHAR(255) NOT NULL",
-          "host1" => "VARCHAR(255) NOT NULL",
-          "authmech1" => "ENUM('PLAIN','LOGIN','CRAM-MD5') DEFAULT 'PLAIN'",
+          "source_id" => "INT NOT NULL",
           "regextrans2" => "VARCHAR(255) DEFAULT ''",
           "authmd51" => "TINYINT(1) NOT NULL DEFAULT 0",
           "domain2" => "VARCHAR(255) NOT NULL DEFAULT ''",
           "subfolder2" => "VARCHAR(255) NOT NULL DEFAULT ''",
           "user1" => "VARCHAR(255) NOT NULL",
-          "password1" => "VARCHAR(255) NOT NULL",
+          "password1" => "VARCHAR(255) NOT NULL DEFAULT ''",
           "exclude" => "VARCHAR(500) NOT NULL DEFAULT ''",
           "maxage" => "SMALLINT NOT NULL DEFAULT '0'",
-          "mins_interval" => "VARCHAR(50) NOT NULL DEFAULT '0'",
+          "mins_interval" => "SMALLINT UNSIGNED NOT NULL DEFAULT '0'",
           "maxbytespersecond" => "VARCHAR(50) NOT NULL DEFAULT '0'",
-          "port1" => "SMALLINT NOT NULL",
-          "enc1" => "ENUM('TLS','SSL','PLAIN') DEFAULT 'TLS'",
           "delete2duplicates" => "TINYINT(1) NOT NULL DEFAULT '1'",
           "delete1" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "delete2" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "automap" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "skipcrossduplicates" => "TINYINT(1) NOT NULL DEFAULT '0'",
-          "custom_params" => "VARCHAR(512) NOT NULL DEFAULT ''",
+          "custom_params" => "TEXT",
+          // original legacy custom_params string, only set when options were dropped during migration (never used by the runner)
+          "custom_params_legacy" => "TEXT DEFAULT NULL",
           "timeout1" => "SMALLINT NOT NULL DEFAULT '600'",
           "timeout2" => "SMALLINT NOT NULL DEFAULT '600'",
           "subscribeall" => "TINYINT(1) NOT NULL DEFAULT '1'",
+          "dry" => "TINYINT(1) NOT NULL DEFAULT '0'",
           "is_running" => "TINYINT(1) NOT NULL DEFAULT '0'",
-          "returned_text" => "MEDIUMTEXT",
+          "prio" => "INT NOT NULL DEFAULT 0",
+          "returned_text" => "LONGTEXT",
           "last_run" => "TIMESTAMP NULL DEFAULT NULL",
+          "success" => "TINYINT(1) UNSIGNED DEFAULT NULL",
+          "exit_status" => "VARCHAR(50) DEFAULT NULL",
           "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
           "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP",
           "active" => "TINYINT(1) NOT NULL DEFAULT '0'"
@@ -480,6 +1247,32 @@ function init_db_schema() {
         "keys" => array(
           "primary" => array(
             "" => array("id")
+          ),
+          "key" => array(
+            "idx_source_id" => array("source_id"),
+            "idx_prio" => array("prio")
+          ),
+          "fkey" => array(
+            "fk_imapsync_source" => array(
+              "col" => "source_id",
+              "ref" => "imapsync_source.id",
+              "delete" => "RESTRICT",
+              "update" => "NO ACTION"
+            )
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "imapsync_settings" => array(
+        "cols" => array(
+          "name" => "VARCHAR(64) NOT NULL",
+          "value" => "VARCHAR(255) NOT NULL",
+          "created" => "DATETIME(0) NOT NULL DEFAULT NOW(0)",
+          "modified" => "DATETIME ON UPDATE CURRENT_TIMESTAMP"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("name")
           )
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
@@ -529,10 +1322,10 @@ function init_db_schema() {
           "id" => "INT NOT NULL AUTO_INCREMENT",
           "key_id" => "VARCHAR(255) NOT NULL",
           "username" => "VARCHAR(255) NOT NULL",
-          "authmech" => "ENUM('yubi_otp', 'u2f', 'hotp', 'totp')",
+          "authmech" => "ENUM('yubi_otp', 'u2f', 'hotp', 'totp', 'webauthn')",
           "secret" => "VARCHAR(255) DEFAULT NULL",
-          "keyHandle" => "VARCHAR(255) DEFAULT NULL",
-          "publicKey" => "VARCHAR(255) DEFAULT NULL",
+          "keyHandle" => "VARCHAR(1023) DEFAULT NULL",
+          "publicKey" => "VARCHAR(4096) DEFAULT NULL",
           "counter" => "INT NOT NULL DEFAULT '0'",
           "certificate" => "TEXT",
           "active" => "TINYINT(1) NOT NULL DEFAULT '0'"
@@ -640,7 +1433,7 @@ function init_db_schema() {
         "cols" => array(
           "c_folder_id" => "INT NOT NULL",
           "c_name" => "VARCHAR(255) NOT NULL",
-          "c_uid" => "VARCHAR(255) NOT NULL",
+          "c_uid" => "VARCHAR(1000) NOT NULL",
           "c_startdate" => "INT",
           "c_enddate" => "INT",
           "c_cycleenddate" => "INT",
@@ -680,7 +1473,7 @@ function init_db_schema() {
           "c_screenname" => "VARCHAR(255)",
           "c_l" => "VARCHAR(255)",
           "c_mail" => "TEXT",
-          "c_o" => "VARCHAR(255)",
+          "c_o" => "VARCHAR(500)",
           "c_ou" => "VARCHAR(255)",
           "c_telephonenumber" => "VARCHAR(255)",
           "c_categories" => "VARCHAR(255)",
@@ -697,7 +1490,7 @@ function init_db_schema() {
       "sogo_sessions_folder" => array(
         "cols" => array(
           "c_id" => "VARCHAR(255) NOT NULL",
-          "c_value" => "VARCHAR(255) NOT NULL",
+          "c_value" => "VARCHAR(4096) NOT NULL",
           "c_creationdate" => "INT(11) NOT NULL",
           "c_lastseen" => "INT(11) NOT NULL"
         ),
@@ -725,6 +1518,37 @@ function init_db_schema() {
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
       ),
+      "sogo_admin" => array(
+        "cols" => array(
+          "c_key" => "VARCHAR(255) NOT NULL DEFAULT ''",
+          "c_content"  => "mediumtext NOT NULL",
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("c_key")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "pushover" => array(
+        "cols" => array(
+          "username" => "VARCHAR(255) NOT NULL",
+          "key" => "VARCHAR(255) NOT NULL",
+          "token" => "VARCHAR(255) NOT NULL",
+          "attributes" => "JSON",
+          "title" => "TEXT",
+          "text" => "TEXT",
+          "senders" => "TEXT",
+          "senders_regex" => "TEXT",
+          "active" => "TINYINT(1) NOT NULL DEFAULT '1'"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("username")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
       "sogo_user_profile" => array(
         "cols" => array(
           "c_uid" => "VARCHAR(255) NOT NULL",
@@ -734,6 +1558,75 @@ function init_db_schema() {
         "keys" => array(
           "primary" => array(
             "" => array("c_uid")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "oauth_clients" => array(
+        "cols" => array(
+          "id" => "INT NOT NULL AUTO_INCREMENT",
+          "client_id" => "VARCHAR(80) NOT NULL",
+          "client_secret" => "VARCHAR(80)",
+          "redirect_uri" => "VARCHAR(2000)",
+          "grant_types" => "VARCHAR(80)",
+          "scope" => "VARCHAR(4000)",
+          "user_id" => "VARCHAR(80)"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("client_id")
+          ),
+          "unique" => array(
+            "id" => array("id")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "oauth_access_tokens" => array(
+        "cols" => array(
+          "access_token" => "VARCHAR(40) NOT NULL",
+          "client_id" => "VARCHAR(80) NOT NULL",
+          "user_id" => "VARCHAR(80)",
+          "expires" => "TIMESTAMP NOT NULL",
+          "scope" => "VARCHAR(4000)"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("access_token")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "oauth_authorization_codes" => array(
+        "cols" => array(
+          "authorization_code" => "VARCHAR(40) NOT NULL",
+          "client_id" => "VARCHAR(80) NOT NULL",
+          "user_id" => "VARCHAR(80)",
+          "redirect_uri" => "VARCHAR(2000)",
+          "expires" => "TIMESTAMP NOT NULL",
+          "scope" => "VARCHAR(4000)",
+          "id_token" => "VARCHAR(1000)",
+          "code_challenge" => "VARCHAR(1000)",
+          "code_challenge_method" => "VARCHAR(20)"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("authorization_code")
+          )
+        ),
+        "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+      ),
+      "oauth_refresh_tokens" => array(
+        "cols" => array(
+          "refresh_token" => "VARCHAR(40) NOT NULL",
+          "client_id" => "VARCHAR(80) NOT NULL",
+          "user_id" => "VARCHAR(80)",
+          "expires" => "TIMESTAMP NOT NULL",
+          "scope" => "VARCHAR(4000)"
+        ),
+        "keys" => array(
+          "primary" => array(
+            "" => array("refresh_token")
           )
         ),
         "attr" => "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
@@ -753,12 +1646,13 @@ function init_db_schema() {
           }
         }
       }
+
       // Migrate tls_enforce_* options
       if ($table == 'mailbox') {
         $stmt = $pdo->query("SHOW TABLES LIKE 'mailbox'");
         $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
         if ($num_results != 0) {
-          $stmt = $pdo->query("SHOW COLUMNS FROM `mailbox` LIKE '%tls_enforce%'"); 
+          $stmt = $pdo->query("SHOW COLUMNS FROM `mailbox` LIKE '%tls_enforce%'");
           $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
           if ($num_results != 0) {
             $stmt = $pdo->query("SELECT `username`, `tls_enforce_in`, `tls_enforce_out` FROM `mailbox`");
@@ -769,18 +1663,146 @@ function init_db_schema() {
           }
         }
       }
-      $stmt = $pdo->query("SHOW TABLES LIKE '" . $table . "'"); 
+
+      // Migrate legacy imapsync jobs (host/port/enc per job) to domain-scoped legacy sources
+      // Re-entrant: only rows with source_id IS NULL are migrated, the legacy columns are kept while any are left
+      if ($table == 'imapsync') {
+        $stmt = $pdo->query("SHOW TABLES LIKE 'imapsync'");
+        if (count($stmt->fetchAll(PDO::FETCH_ASSOC)) != 0) {
+          $imapsync_cols = array_column($pdo->query("SHOW COLUMNS FROM `imapsync`")->fetchAll(PDO::FETCH_ASSOC), 'Field', 'Field');
+          if (isset($imapsync_cols['host1'])) {
+            if (!isset($imapsync_cols['source_id'])) {
+              $pdo->exec("ALTER TABLE `imapsync` ADD COLUMN `source_id` INT DEFAULT NULL");
+            }
+            if (!isset($imapsync_cols['custom_params_legacy'])) {
+              $pdo->exec("ALTER TABLE `imapsync` ADD COLUMN `custom_params_legacy` TEXT DEFAULT NULL");
+            }
+            // Converted JSON may not fit into the old VARCHAR(512)
+            $pdo->exec("ALTER TABLE `imapsync` MODIFY COLUMN `custom_params` TEXT");
+            $imapsync_allow = \Mailcow\Imapsync\Model\CustomParams::allowlist($GLOBALS['IMAPSYNC_OPTIONS'] ?? [], $GLOBALS['IMAPSYNC_OPTIONS_DEFAULT'] ?? []);
+            // A legacy source is found by its connection and its only target domain (none for jobs without domain)
+            $source_sel = $pdo->prepare("SELECT `id` FROM `imapsync_source` s WHERE `created_by` = '' AND `host1` = :host AND `port1` = :port
+              AND `enc1` = :enc AND `auth_type` = :auth
+              AND (SELECT GROUP_CONCAT(`domain`) FROM `imapsync_source_domain` d WHERE d.`source_id` = s.`id`) <=> NULLIF(:domain, '')
+              ORDER BY `id` LIMIT 1");
+            $source_name_sel = $pdo->prepare("SELECT COUNT(*) FROM `imapsync_source` WHERE `created_by` = '' AND `name` = :name");
+            // The old runner never checked certificates, legacy sources keep that
+            $source_ins = $pdo->prepare("INSERT IGNORE INTO `imapsync_source` (`name`, `description`, `created_by`, `scope`, `host1`, `port1`, `enc1`, `verify_cert`, `auth_type`, `active`)
+              VALUES (:name, 'Migrated sync jobs', '', 'domain', :host, :port, :enc, 0, :auth, 1)");
+            $source_domain_ins = $pdo->prepare("INSERT IGNORE INTO `imapsync_source_domain` (`source_id`, `domain`) VALUES (:id, :domain)");
+            $job_upd = $pdo->prepare("UPDATE `imapsync` SET `source_id` = :source_id, `custom_params` = :cp, `custom_params_legacy` = :cp_legacy,
+              `dry` = GREATEST(`dry`, :dry) WHERE `id` = :id AND `source_id` IS NULL");
+            $stmt = $pdo->query("SELECT `id`, `user2`, `host1`, `port1`, `enc1`, `custom_params` FROM `imapsync` WHERE `source_id` IS NULL");
+            foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+              // Parse the legacy custom_params string like the old runner did (all tokens up to the next option are its value)
+              // into pairs valid under $IMAPSYNC_OPTIONS, a token after a flag is never its value.
+              // --authmech1 PLAIN|LOGIN|CRAM-MD5 becomes the source auth type, --dry the job's dry flag (never run a simulation for real).
+              // Anything else that does not fit is dropped, the original string is then kept in custom_params_legacy.
+              $pairs = array();
+              $auth = null;
+              $dry = false;
+              $dropped = false;
+              $tokens = preg_split('/\s+/', trim((string)$row['custom_params']), -1, PREG_SPLIT_NO_EMPTY);
+              for ($i = 0, $n = count($tokens); $i < $n; $i++) {
+                if ($tokens[$i][0] !== '-') {
+                  // stray value without option
+                  $dropped = true;
+                  continue;
+                }
+                @list($opt, $val) = explode('=', ltrim($tokens[$i], '-'), 2);
+                $opt = strtolower($opt);
+                $inline = ($val !== null);
+                $rest = array();
+                while ($i + 1 < $n && $tokens[$i + 1][0] !== '-') {
+                  $rest[] = $tokens[++$i];
+                }
+                $rule = ($opt === 'authmech1') ? true : ($imapsync_allow[$opt] ?? null);
+                if ($opt === 'dry' || $rule === false) {
+                  if ($inline || !empty($rest)) $dropped = true;
+                  if ($opt === 'dry') {
+                    $dry = true;
+                  } elseif (!$inline) {
+                    $pairs[] = array('o' => $opt, 'v' => '');
+                  }
+                  continue;
+                }
+                // unknown option, or "--opt=a b" (the old runner cut the value at the first space)
+                if ($rule === null || ($inline && !empty($rest))) {
+                  $dropped = true;
+                  continue;
+                }
+                $val = $inline ? $val : implode(' ', $rest);
+                if ($opt === 'authmech1' && $auth === null && in_array(strtoupper($val), array('PLAIN', 'LOGIN', 'CRAM-MD5'), true)) {
+                  $auth = strtoupper($val);
+                } elseif ($opt === 'authmech1' || trim($val) === ''
+                  || (is_string($rule) && preg_match('~^(?:' . str_replace('~', '\~', $rule) . ')$~D', $val) !== 1)) {
+                  $dropped = true;
+                } else {
+                  $pairs[] = array('o' => $opt, 'v' => $val);
+                }
+              }
+              // Old runner ignored the authmech1 column, only a custom --authmech1 was effective
+              $auth = $auth ?? 'PLAIN';
+              $host = strtolower(trim((string)$row['host1']));
+              $port = (intval($row['port1']) >= 1 && intval($row['port1']) <= 65535) ? intval($row['port1']) : 143;
+              $enc = in_array($row['enc1'], array('TLS', 'SSL', 'PLAIN'), true) ? $row['enc1'] : 'TLS';
+              $at = strrchr((string)$row['user2'], '@');
+              $domain = ($at === false) ? '' : strtolower(substr($at, 1));
+              // One source per (host, port, enc, auth, domain), named "host (domain)" plus " 2", " 3"... when taken (<= 100 chars)
+              $conn = array(':host' => $host, ':port' => $port, ':enc' => $enc, ':auth' => $auth);
+              $source_sel->execute($conn + array(':domain' => $domain));
+              if (($source_id = $source_sel->fetchColumn()) === false) {
+                $base = mb_substr($host . ($domain !== '' ? ' (' . $domain . ')' : ''), 0, 94);
+                for ($i = 1, $name = $base; $i < 1000; $name = $base . ' ' . ++$i) {
+                  $source_name_sel->execute(array(':name' => $name));
+                  if ($source_name_sel->fetchColumn() == 0) break;
+                }
+                $source_ins->execute($conn + array(':name' => $name));
+                if (($source_id = $pdo->lastInsertId()) == 0) continue;
+                if ($domain !== '') {
+                  $source_domain_ins->execute(array(':id' => $source_id, ':domain' => $domain));
+                }
+              }
+              $job_upd->execute(array(
+                ':source_id' => $source_id,
+                ':cp' => json_encode($pairs, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                ':cp_legacy' => $dropped ? $row['custom_params'] : null,
+                ':dry' => $dry ? 1 : 0,
+                ':id' => $row['id']
+              ));
+            }
+
+            // Never throw on leftovers: keep source_id nullable and the legacy columns, retried with the next db_version
+            $pending = intval($pdo->query("SELECT COUNT(*) FROM `imapsync` WHERE `source_id` IS NULL")->fetchColumn());
+            if ($pending > 0) {
+              $properties['cols']['source_id'] = "INT DEFAULT NULL";
+              $legacy_col_types = array(
+                'host1' => "VARCHAR(255) DEFAULT NULL",
+                'port1' => "SMALLINT UNSIGNED DEFAULT NULL",
+                'enc1' => "ENUM('TLS','SSL','PLAIN') DEFAULT NULL",
+                'authmech1' => "ENUM('PLAIN','LOGIN','CRAM-MD5') DEFAULT NULL"
+              );
+              foreach ($legacy_col_types as $col => $type) {
+                if (isset($imapsync_cols[$col])) $properties['cols'][$col] = $type;
+              }
+              error_log('mailcow: imapsync migration: ' . $pending . ' sync job(s) could not be assigned to a source and will not run');
+            }
+          }
+        }
+      }
+
+      $stmt = $pdo->query("SHOW TABLES LIKE '" . $table . "'");
       $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
       if ($num_results != 0) {
-        $stmt = $pdo->prepare("SELECT CONCAT('ALTER TABLE ', `table_schema`, '.', `table_name`, ' DROP FOREIGN KEY ', `constraint_name`, ';') AS `FKEY_DROP` FROM `information_schema`.`table_constraints`
-          WHERE `constraint_type` = 'FOREIGN KEY' AND `table_name` = :table;");
+        $stmt = $pdo->prepare("SELECT CONCAT('ALTER TABLE `', `table_schema`, '`.', `table_name`, ' DROP FOREIGN KEY ', `constraint_name`, ';') AS `FKEY_DROP` FROM `information_schema`.`table_constraints`
+          WHERE `constraint_type` = 'FOREIGN KEY' AND `table_schema` = DATABASE() AND `table_name` = :table;");
         $stmt->execute(array(':table' => $table));
         $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
         while ($row = array_shift($rows)) {
           $pdo->query($row['FKEY_DROP']);
         }
-        foreach($properties['cols'] as $column => $type) {
-          $stmt = $pdo->query("SHOW COLUMNS FROM `" . $table . "` LIKE '" . $column . "'"); 
+        foreach ($properties['cols'] as $column => $type) {
+          $stmt = $pdo->query("SHOW COLUMNS FROM `" . $table . "` LIKE '" . $column . "'");
           $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
           if ($num_results == 0) {
             if (strpos($type, 'AUTO_INCREMENT') !== false) {
@@ -793,16 +1815,15 @@ function init_db_schema() {
               }
             }
             $pdo->query("ALTER TABLE `" . $table . "` ADD `" . $column . "` " . $type);
-          }
-          else {
+          } else {
             $pdo->query("ALTER TABLE `" . $table . "` MODIFY COLUMN `" . $column . "` " . $type);
           }
         }
-        foreach($properties['keys'] as $key_type => $key_content) {
+        foreach ($properties['keys'] as $key_type => $key_content) {
           if (strtolower($key_type) == 'primary') {
             foreach ($key_content as $key_values) {
               $fields = "`" . implode("`, `", $key_values) . "`";
-              $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE Key_name = 'PRIMARY'"); 
+              $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE Key_name = 'PRIMARY'");
               $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
               $is_drop = ($num_results != 0) ? "DROP PRIMARY KEY, " : "";
               $pdo->query("ALTER TABLE `" . $table . "` " . $is_drop . "ADD PRIMARY KEY (" . $fields . ")");
@@ -811,7 +1832,7 @@ function init_db_schema() {
           if (strtolower($key_type) == 'key') {
             foreach ($key_content as $key_name => $key_values) {
               $fields = "`" . implode("`, `", $key_values) . "`";
-              $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE Key_name = '" . $key_name . "'"); 
+              $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE Key_name = '" . $key_name . "'");
               $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
               $is_drop = ($num_results != 0) ? "DROP INDEX `" . $key_name . "`, " : "";
               $pdo->query("ALTER TABLE `" . $table . "` " . $is_drop . "ADD KEY `" . $key_name . "` (" . $fields . ")");
@@ -820,7 +1841,7 @@ function init_db_schema() {
           if (strtolower($key_type) == 'unique') {
             foreach ($key_content as $key_name => $key_values) {
               $fields = "`" . implode("`, `", $key_values) . "`";
-              $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE Key_name = '" . $key_name . "'"); 
+              $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE Key_name = '" . $key_name . "'");
               $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
               $is_drop = ($num_results != 0) ? "DROP INDEX `" . $key_name . "`, " : "";
               $pdo->query("ALTER TABLE `" . $table . "` " . $is_drop . "ADD UNIQUE KEY `" . $key_name . "` (" . $fields . ")");
@@ -829,7 +1850,7 @@ function init_db_schema() {
           if (strtolower($key_type) == 'fkey') {
             foreach ($key_content as $key_name => $key_values) {
               $fields = "`" . implode("`, `", $key_values) . "`";
-              $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE Key_name = '" . $key_name . "'"); 
+              $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE Key_name = '" . $key_name . "'");
               $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
               if ($num_results != 0) {
                 $pdo->query("ALTER TABLE `" . $table . "` DROP INDEX `" . $key_name . "`");
@@ -841,8 +1862,8 @@ function init_db_schema() {
           }
         }
         // Drop all vanished columns
-        $stmt = $pdo->query("SHOW COLUMNS FROM `" . $table . "`"); 
-        $cols_in_table = $stmt->fetchAll(PDO::FETCH_ASSOC); 
+        $stmt = $pdo->query("SHOW COLUMNS FROM `" . $table . "`");
+        $cols_in_table = $stmt->fetchAll(PDO::FETCH_ASSOC);
         while ($row = array_shift($cols_in_table)) {
           if (!array_key_exists($row['Field'], $properties['cols'])) {
             $pdo->query("ALTER TABLE `" . $table . "` DROP COLUMN `" . $row['Field'] . "`;");
@@ -850,23 +1871,23 @@ function init_db_schema() {
         }
 
         // Step 1: Get all non-primary keys, that currently exist and those that should exist
-        $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE `Key_name` != 'PRIMARY'"); 
-        $keys_in_table = $stmt->fetchAll(PDO::FETCH_ASSOC); 
+        $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE `Key_name` != 'PRIMARY'");
+        $keys_in_table = $stmt->fetchAll(PDO::FETCH_ASSOC);
         $keys_to_exist = array();
         if (isset($properties['keys']['unique']) && is_array($properties['keys']['unique'])) {
           foreach ($properties['keys']['unique'] as $key_name => $key_values) {
-             $keys_to_exist[] = $key_name;
+            $keys_to_exist[] = $key_name;
           }
         }
         if (isset($properties['keys']['key']) && is_array($properties['keys']['key'])) {
           foreach ($properties['keys']['key'] as $key_name => $key_values) {
-             $keys_to_exist[] = $key_name;
+            $keys_to_exist[] = $key_name;
           }
         }
         // Index for foreign key must exist
         if (isset($properties['keys']['fkey']) && is_array($properties['keys']['fkey'])) {
           foreach ($properties['keys']['fkey'] as $key_name => $key_values) {
-             $keys_to_exist[] = $key_name;
+            $keys_to_exist[] = $key_name;
           }
         }
         // Step 2: Drop all vanished indexes
@@ -877,42 +1898,37 @@ function init_db_schema() {
         }
         // Step 3: Drop all vanished primary keys
         if (!isset($properties['keys']['primary'])) {
-          $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE Key_name = 'PRIMARY'"); 
+          $stmt = $pdo->query("SHOW KEYS FROM `" . $table . "` WHERE Key_name = 'PRIMARY'");
           $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
           if ($num_results != 0) {
             $pdo->query("ALTER TABLE `" . $table . "` DROP PRIMARY KEY");
           }
         }
-      }
-      else {
+      } else {
         // Create table if it is missing
         $sql = "CREATE TABLE IF NOT EXISTS `" . $table . "` (";
-        foreach($properties['cols'] as $column => $type) {
+        foreach ($properties['cols'] as $column => $type) {
           $sql .= "`" . $column . "` " . $type . ",";
         }
-        foreach($properties['keys'] as $key_type => $key_content) {
+        foreach ($properties['keys'] as $key_type => $key_content) {
           if (strtolower($key_type) == 'primary') {
             foreach ($key_content as $key_values) {
               $fields = "`" . implode("`, `", $key_values) . "`";
               $sql .= "PRIMARY KEY (" . $fields . ")" . ",";
             }
-          }
-          elseif (strtolower($key_type) == 'key') {
+          } elseif (strtolower($key_type) == 'key') {
             foreach ($key_content as $key_name => $key_values) {
               $fields = "`" . implode("`, `", $key_values) . "`";
               $sql .= "KEY `" . $key_name . "` (" . $fields . ")" . ",";
             }
-          }
-          elseif (strtolower($key_type) == 'unique') {
+          } elseif (strtolower($key_type) == 'unique') {
             foreach ($key_content as $key_name => $key_values) {
               $fields = "`" . implode("`, `", $key_values) . "`";
               $sql .= "UNIQUE KEY `" . $key_name . "` (" . $fields . ")" . ",";
             }
-          }
-          elseif (strtolower($key_type) == 'fkey') {
+          } elseif (strtolower($key_type) == 'fkey') {
             foreach ($key_content as $key_name => $key_values) {
               @list($table_ref, $field_ref) = explode('.', $key_values['ref']);
-              $fields = "`" . implode("`, `", $key_values) . "`";
               $sql .= "FOREIGN KEY `" . $key_name . "` (" . $key_values['col'] . ") REFERENCES `" . $table_ref . "` (`" . $field_ref . "`)
                 ON DELETE " . $key_values['delete'] . " ON UPDATE " . $key_values['update'] . ",";
             }
@@ -924,7 +1940,6 @@ function init_db_schema() {
       }
       // Reset table attributes
       $pdo->query("ALTER TABLE `" . $table . "` " . $properties['attr'] . ";");
-
     }
 
     // Recreate SQL views
@@ -933,43 +1948,191 @@ function init_db_schema() {
       $pdo->query($create);
     }
 
-    // Create events to clean database
-    $events[] = 'DROP EVENT IF EXISTS clean_spamalias;
-DELIMITER //
-CREATE EVENT clean_spamalias 
-ON SCHEDULE EVERY 1 DAY DO 
-BEGIN
-  DELETE FROM spamalias WHERE validity < UNIX_TIMESTAMP();
-END;
-//
-DELIMITER ;';
-    foreach ($events as $event) {
-      $pdo->exec($event);
+    // Clear old app_passwd log entries
+    $pdo->exec("DELETE FROM logs
+      WHERE role != 'unauthenticated'
+        AND JSON_EXTRACT(`call`, '$[0]') = 'app_passwd'
+        AND JSON_EXTRACT(`call`, '$[1]') = 'edit'
+        AND (JSON_CONTAINS_PATH(`call`, 'one', '$[2].password')
+          OR JSON_CONTAINS_PATH(`call`, 'one', '$[2].password2'));");
+
+    // Mask syncjob secrets in old log entries (data and attr arguments of the logged call)
+    $mask_paths = array();
+    $unmasked = array();
+    foreach (array(3, 4) as $idx) {
+      foreach (array('password1', 'password2', 'oauth_client_secret', 'oauth_extra_params') as $key) {
+        $mask_paths[] = "'$[" . $idx . "]." . $key . "'";
+        // only rows still holding a value other than the string '*' (objects/arrays/numbers included), missing paths are NULL
+        $unmasked[] = "JSON_UNQUOTE(JSON_EXTRACT(`call`, '$[" . $idx . "]." . $key . "')) <> '*'";
+      }
     }
+    $pdo->exec("UPDATE `logs` SET `call` = JSON_REPLACE(`call`, " . implode(", '*', ", $mask_paths) . ", '*')
+      WHERE JSON_VALID(`call`)
+        AND (JSON_VALUE(`call`, '$[0]') = 'syncjob'
+          OR JSON_VALUE(`call`, '$[0]') LIKE 'imapsync%'
+          OR (JSON_VALUE(`call`, '$[0]') = 'mailbox' AND JSON_VALUE(`call`, '$[2]') = 'syncjob'))
+        AND (" . implode(" OR ", $unmasked) . ");");
+
+    // Migrate webauthn tfa
+    $stmt = $pdo->query("ALTER TABLE `tfa` MODIFY COLUMN `authmech` ENUM('yubi_otp', 'u2f', 'hotp', 'totp', 'webauthn')");
+
+    // Syncjobs: seed global settings
+    $pdo->query("INSERT IGNORE INTO `imapsync_settings` (`name`, `value`) VALUES ('max_parallel', '1')");
 
     // Inject admin if not exists
-    $stmt = $pdo->query("SELECT NULL FROM `admin`"); 
+    $stmt = $pdo->query("SELECT NULL FROM `admin`");
     $num_results = count($stmt->fetchAll(PDO::FETCH_ASSOC));
     if ($num_results == 0) {
-    $stmt = $pdo->query("INSERT INTO `admin` (`username`, `password`, `superadmin`, `created`, `modified`, `active`)
+      $pdo->query("INSERT INTO `admin` (`username`, `password`, `superadmin`, `created`, `modified`, `active`)
       VALUES ('admin', '{SSHA256}K8eVJ6YsZbQCfuJvSUbaQRLr0HPLz5rC9IAp0PAFl0tmNDBkMDc0NDAyOTAxN2Rk', 1, NOW(), NOW(), 1)");
-    $stmt = $pdo->query("INSERT INTO `domain_admins` (`username`, `domain`, `created`, `active`)
+      $pdo->query("INSERT INTO `domain_admins` (`username`, `domain`, `created`, `active`)
         SELECT `username`, 'ALL', NOW(), 1 FROM `admin`
           WHERE superadmin='1' AND `username` NOT IN (SELECT `username` FROM `domain_admins`);");
-    $stmt = $pdo->query("DELETE FROM `admin` WHERE `username` NOT IN  (SELECT `username` FROM `domain_admins`);");
+      $pdo->query("DELETE FROM `admin` WHERE `username` NOT IN  (SELECT `username` FROM `domain_admins`);");
     }
     // Insert new DB schema version
-    $stmt = $pdo->query("REPLACE INTO `versions` (`application`, `version`) VALUES ('db_schema', '" . $db_version . "');"); 
+    $pdo->query("REPLACE INTO `versions` (`application`, `version`) VALUES ('db_schema', '" . $db_version . "');");
 
-    // Migrate tls_enforce_* options and add force_pw_update attribute
-    $stmt = $pdo->query("UPDATE `mailbox` SET `attributes` = '{}' WHERE `attributes` IS NULL;");
-    $stmt = $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.force_pw_update', 0) WHERE JSON_EXTRACT(`attributes`, '$.force_pw_update') IS NULL;");
-    foreach($tls_options as $tls_user => $tls_options) {
+    // Fix dangling domain admins
+    $pdo->query("DELETE FROM `admin` WHERE `superadmin` = 0 AND `username` NOT IN (SELECT `username`FROM `domain_admins`);");
+    $pdo->query("DELETE FROM `da_acl` WHERE `username` NOT IN (SELECT `username`FROM `domain_admins`);");
+
+    // Migrate attributes
+    // pushover
+    $pdo->query("UPDATE `pushover` SET `attributes` = '{}' WHERE `attributes` = '' OR `attributes` IS NULL;");
+    $pdo->query("UPDATE `pushover` SET `attributes` =  JSON_SET(`attributes`, '$.evaluate_x_prio', \"0\") WHERE JSON_VALUE(`attributes`, '$.evaluate_x_prio') IS NULL;");
+    $pdo->query("UPDATE `pushover` SET `attributes` =  JSON_SET(`attributes`, '$.only_x_prio', \"0\") WHERE JSON_VALUE(`attributes`, '$.only_x_prio') IS NULL;");
+    $pdo->query("UPDATE `pushover` SET `attributes` =  JSON_SET(`attributes`, '$.sound', \"pushover\") WHERE JSON_VALUE(`attributes`, '$.sound') IS NULL;");
+    // mailbox
+    $pdo->query("UPDATE `mailbox` SET `attributes` = '{}' WHERE `attributes` = '' OR `attributes` IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.passwd_update', \"0\") WHERE JSON_VALUE(`attributes`, '$.passwd_update') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.relayhost', \"0\") WHERE JSON_VALUE(`attributes`, '$.relayhost') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.force_pw_update', \"0\") WHERE JSON_VALUE(`attributes`, '$.force_pw_update') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.force_tfa', \"0\") WHERE JSON_VALUE(`attributes`, '$.force_tfa') IS NULL;");
+    // admin attributes
+    $pdo->query("UPDATE `admin` SET `attributes` = '{}' WHERE `attributes` = '' OR `attributes` IS NULL;");
+    $pdo->query("UPDATE `admin` SET `attributes` =  JSON_SET(`attributes`, '$.force_tfa', \"0\") WHERE JSON_VALUE(`attributes`, '$.force_tfa') IS NULL;");
+    $pdo->query("UPDATE `admin` SET `attributes` =  JSON_SET(`attributes`, '$.force_pw_update', \"0\") WHERE JSON_VALUE(`attributes`, '$.force_pw_update') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.sieve_access', \"1\") WHERE JSON_VALUE(`attributes`, '$.sieve_access') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.sogo_access', \"1\") WHERE JSON_VALUE(`attributes`, '$.sogo_access') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.imap_access', \"1\") WHERE JSON_VALUE(`attributes`, '$.imap_access') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.pop3_access', \"1\") WHERE JSON_VALUE(`attributes`, '$.pop3_access') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.smtp_access', \"1\") WHERE JSON_VALUE(`attributes`, '$.smtp_access') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.eas_access', \"1\") WHERE JSON_VALUE(`attributes`, '$.eas_access') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.dav_access', \"1\") WHERE JSON_VALUE(`attributes`, '$.dav_access') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.mailbox_format', \"maildir:\") WHERE JSON_VALUE(`attributes`, '$.mailbox_format') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.quarantine_notification', \"never\") WHERE JSON_VALUE(`attributes`, '$.quarantine_notification') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.quarantine_category', \"reject\") WHERE JSON_VALUE(`attributes`, '$.quarantine_category') IS NULL;");
+    foreach ($tls_options as $tls_user => $tls_options) {
       $stmt = $pdo->prepare("UPDATE `mailbox` SET `attributes` = JSON_SET(`attributes`, '$.tls_enforce_in', :tls_enforce_in),
         `attributes` = JSON_SET(`attributes`, '$.tls_enforce_out', :tls_enforce_out)
           WHERE `username` = :username");
       $stmt->execute(array(':tls_enforce_in' => $tls_options['tls_enforce_in'], ':tls_enforce_out' => $tls_options['tls_enforce_out'], ':username' => $tls_user));
     }
+    // Set tls_enforce_* if still missing (due to deleted attrs for example)
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.tls_enforce_out', \"1\") WHERE JSON_VALUE(`attributes`, '$.tls_enforce_out') IS NULL;");
+    $pdo->query("UPDATE `mailbox` SET `attributes` =  JSON_SET(`attributes`, '$.tls_enforce_in', \"1\") WHERE JSON_VALUE(`attributes`, '$.tls_enforce_in') IS NULL;");
+    // Fix ACL
+    $pdo->query("INSERT INTO `user_acl` (`username`) SELECT `username` FROM `mailbox` WHERE `kind` = '' AND NOT EXISTS (SELECT `username` FROM `user_acl`);");
+    $pdo->query("INSERT INTO `da_acl` (`username`) SELECT DISTINCT `username` FROM `domain_admins` WHERE `username` != 'admin' AND NOT EXISTS (SELECT `username` FROM `da_acl`);");
+    // Fix domain_admins
+    $pdo->query("DELETE FROM `domain_admins` WHERE `domain` = 'ALL';");
+
+    // add default templates
+    $default_domain_template = array(
+      "template" => "Default",
+      "type" => "domain",
+      "attributes" => array(
+        "tags" => array(),
+        "max_num_aliases_for_domain" => 400,
+        "max_num_mboxes_for_domain" => 10,
+        "def_quota_for_mbox" => 3072 * 1048576,
+        "max_quota_for_mbox" => 10240 * 1048576,
+        "max_quota_for_domain" => 10240 * 1048576,
+        "rl_frame" => "s",
+        "rl_value" => "",
+        "active" => 1,
+        "gal" => 1,
+        "backupmx" => 0,
+        "relay_all_recipients" => 0,
+        "relay_unknown_only" => 0,
+        "dkim_selector" => "dkim",
+        "key_size" => 2048,
+        "max_quota_for_domain" => 10240 * 1048576,
+      )
+    );
+    $default_mailbox_template = array(
+      "template" => "Default",
+      "type" => "mailbox",
+      "attributes" => array(
+        "tags" => array(),
+        "quota" => 0,
+        "quarantine_notification" => strval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['quarantine_notification']),
+        "quarantine_category" => strval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['quarantine_category']),
+        "rl_frame" => "s",
+        "rl_value" => "",
+        "force_pw_update" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['force_pw_update']),
+        "force_tfa" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['force_tfa']),
+        "sogo_access" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['sogo_access']),
+        "active" => 1,
+        "tls_enforce_in" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['tls_enforce_in']),
+        "tls_enforce_out" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['tls_enforce_out']),
+        "imap_access" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['imap_access']),
+        "pop3_access" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['pop3_access']),
+        "smtp_access" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['smtp_access']),
+        "sieve_access" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['sieve_access']),
+        "eas_access" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['eas_access']),
+        "dav_access" => intval($GLOBALS['MAILBOX_DEFAULT_ATTRIBUTES']['dav_access']),
+        "acl_spam_alias" => 1,
+        "acl_tls_policy" => 1,
+        "acl_spam_score" => 1,
+        "acl_spam_policy" => 1,
+        "acl_delimiter_action" => 1,
+        "acl_syncjobs" => 0,
+        "acl_eas_reset" => 1,
+        "acl_sogo_profile_reset" => 0,
+        "acl_pushover" => 1,
+        "acl_quarantine" => 1,
+        "acl_quarantine_attachments" => 1,
+        "acl_quarantine_notification" => 1,
+        "acl_quarantine_category" => 1,
+        "acl_app_passwds" => 1,
+      )
+    );
+    $stmt = $pdo->prepare("SELECT id FROM `templates` WHERE `type` = :type AND `template` = :template");
+    $stmt->execute(array(
+      ":type" => "domain",
+      ":template" => $default_domain_template["template"]
+    ));
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (empty($row)) {
+      $stmt = $pdo->prepare("INSERT INTO `templates` (`type`, `template`, `attributes`)
+        VALUES (:type, :template, :attributes)");
+      $stmt->execute(array(
+        ":type" => "domain",
+        ":template" => $default_domain_template["template"],
+        ":attributes" => json_encode($default_domain_template["attributes"])
+      ));
+    }
+    $stmt = $pdo->prepare("SELECT id FROM `templates` WHERE `type` = :type AND `template` = :template");
+    $stmt->execute(array(
+      ":type" => "mailbox",
+      ":template" => $default_mailbox_template["template"]
+    ));
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (empty($row)) {
+      $stmt = $pdo->prepare("INSERT INTO `templates` (`type`, `template`, `attributes`)
+        VALUES (:type, :template, :attributes)");
+      $stmt->execute(array(
+        ":type" => "mailbox",
+        ":template" => $default_mailbox_template["template"],
+        ":attributes" => json_encode($default_mailbox_template["attributes"])
+      ));
+    }
+
+    // remove old sogo views and triggers
+    $pdo->query("DROP TRIGGER IF EXISTS sogo_update_password");
+
     if (php_sapi_name() == "cli") {
       echo "DB initialization completed" . PHP_EOL;
     } else {
@@ -979,13 +2142,23 @@ DELIMITER ;';
         'msg' => 'db_init_complete'
       );
     }
-    // Fix ACL
-    $stmt = $pdo->query("INSERT INTO `user_acl` (`username`) SELECT `username` FROM `mailbox` WHERE `kind` = '' AND NOT EXISTS (SELECT `username` FROM `user_acl`);");
-    $stmt = $pdo->query("INSERT INTO `da_acl` (`username`) SELECT DISTINCT `username` FROM `domain_admins` WHERE `username` != 'admin' AND NOT EXISTS (SELECT `username` FROM `da_acl`);");
-    // Fix domain_admins
-    $stmt = $pdo->query("DELETE FROM `domain_admins` WHERE `domain` = 'ALL';");
-  }
-  catch (PDOException $e) {
+
+    // fill quarantine.qhash
+    $pdo->query("UPDATE `quarantine` SET `qhash` = SHA2(CONCAT(`id`, `qid`), 256) WHERE ISNULL(`qhash`)");
+
+    // Group rows that lost their group_id (init_db of an older version ran) belong to their group again, so the
+    // group can update its alias and revokes send-as rights of former members. An active group without rows of its
+    // own for a grant only exists after such a downgrade; manual rows next to group rows stay manual.
+    $pdo->query("UPDATE `alias` a JOIN `mailbox_group` g ON g.`address` = a.`address` SET a.`group_id` = g.`id` WHERE a.`group_id` IS NULL");
+    $pdo->query("UPDATE `sender_acl` s
+      JOIN `mailbox_group_member` m ON m.`username` = s.`logged_in_as`
+      JOIN `mailbox_group` g ON g.`id` = m.`group_id` AND g.`active` = 1
+      JOIN `mailbox_group_send_as` ga ON ga.`group_id` = m.`group_id` AND ga.`address` = s.`send_as`
+      SET s.`group_id` = m.`group_id`
+      WHERE s.`group_id` IS NULL AND s.`external` = 0
+        AND NOT EXISTS (SELECT 1 FROM (SELECT `group_id` FROM `sender_acl` WHERE `group_id` IS NOT NULL) own WHERE own.`group_id` = m.`group_id`)");
+
+  } catch (PDOException $e) {
     if (php_sapi_name() == "cli") {
       echo "DB initialization failed: " . print_r($e, true) . PHP_EOL;
     } else {
@@ -999,20 +2172,54 @@ DELIMITER ;';
 }
 if (php_sapi_name() == "cli") {
   include '/web/inc/vars.inc.php';
-  $now = new DateTime();
-  $mins = $now->getOffset() / 60;
-  $sgn = ($mins < 0 ? -1 : 1);
-  $mins = abs($mins);
-  $hrs = floor($mins / 60);
-  $mins -= $hrs * 60;
-  $offset = sprintf('%+d:%02d', $hrs*$sgn, $mins);
+  if (file_exists('/web/inc/vars.local.inc.php')) {
+    include '/web/inc/vars.local.inc.php';
+  }
+  require_once '/web/inc/lib/vendor/autoload.php';
+  include '/web/inc/functions.inc.php';
+  include '/web/inc/functions.docker.inc.php';
+  // $now = new DateTime();
+  // $mins = $now->getOffset() / 60;
+  // $sgn = ($mins < 0 ? -1 : 1);
+  // $mins = abs($mins);
+  // $hrs = floor($mins / 60);
+  // $mins -= $hrs * 60;
+  // $offset = sprintf('%+d:%02d', $hrs*$sgn, $mins);
   $dsn = $database_type . ":unix_socket=" . $database_sock . ";dbname=" . $database_name;
   $opt = [
     PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
     PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
     PDO::ATTR_EMULATE_PREPARES   => false,
-    PDO::MYSQL_ATTR_INIT_COMMAND => "SET time_zone = '" . $offset . "', group_concat_max_len = 3423543543;",
+    //PDO::MYSQL_ATTR_INIT_COMMAND => "SET time_zone = '" . $offset . "', group_concat_max_len = 3423543543;",
   ];
   $pdo = new PDO($dsn, $database_user, $database_pass, $opt);
+  $stmt = $pdo->query("SELECT COUNT('OK') AS OK_C FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND (TABLE_NAME = 'sogo_view' OR TABLE_NAME = '_sogo_static_view');");
+  $res = $stmt->fetch(PDO::FETCH_ASSOC);
+  if (intval($res['OK_C']) === 2) {
+    // Be more precise when replacing into _sogo_static_view, col orders may change
+    try {
+      update_sogo_static_view();
+      echo "Fixed _sogo_static_view" . PHP_EOL;
+    } catch (Exception $e) {
+      // Dunno
+    }
+  }
+  try {
+    $m = new Memcached();
+    $m->addServer('memcached', 11211);
+    $m->flush();
+    echo "Cleaned up memcached" . PHP_EOL;
+  } catch (Exception $e) {
+    // Dunno
+  }
   init_db_schema();
+  // Service API keys from mailcow.conf (API_KEY, API_KEY_READ_ONLY, API_ALLOW_FROM)
+  try {
+    $api_keys = \Mailcow\ApiKey\ApiKeyModule::create($pdo, \Mailcow\Core\Context::system())->keys;
+    foreach ($api_keys->syncServiceKeys(getenv()) as $warning) {
+      echo "API service keys: " . $warning . PHP_EOL;
+    }
+  } catch (PDOException $e) {
+    echo "API service keys: sync failed: " . $e->getMessage() . PHP_EOL;
+  }
 }

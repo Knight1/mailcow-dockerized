@@ -1,5 +1,5 @@
 <?php
-function acl($_action, $_scope = null, $_data = null) {
+function acl($_action, $_scope = null, $_data = null, $_extra = null) {
   global $pdo;
   global $lang;
   $_data_log = $_data;
@@ -24,7 +24,7 @@ function acl($_action, $_scope = null, $_data = null) {
             }
             // Users cannot change their own ACL
             if (!hasMailboxObjectAccess($_SESSION['mailcow_cc_username'], $_SESSION['mailcow_cc_role'], $username)
-              || ($_SESSION['mailcow_cc_role'] != 'admin' && $_SESSION['mailcow_cc_role'] != 'domainadmin')) {
+              || ($_SESSION['mailcow_cc_role'] != 'admin' && $_SESSION['mailcow_cc_role'] != 'domainadmin' && $_SESSION['access_all_exception'] != '1')) {
               $_SESSION['return'][] = array(
                 'type' => 'danger',
                 'log' => array(__FUNCTION__, $_action, $_scope, $_data_log),
@@ -34,7 +34,7 @@ function acl($_action, $_scope = null, $_data = null) {
             }
             // Read all available acl options by calling acl(get)
             // Set all available acl options we cannot find in the post data to 0, else 1
-            $is_now = acl('get', 'user', $username);
+            $is_now = acl('get', 'user', $username, $_extra);
             if (!empty($is_now)) {
               foreach ($is_now as $acl_now_name => $acl_now_val) {
                 $set_acls[$acl_now_name] = (isset($acl_post[$acl_now_name])) ? 1 : 0;
@@ -136,6 +136,16 @@ function acl($_action, $_scope = null, $_data = null) {
           $stmt = $pdo->prepare("SELECT * FROM `user_acl` WHERE `username` = :username");
           $stmt->execute(array(':username' => $_data));
           $data = $stmt->fetch(PDO::FETCH_ASSOC);
+          if ($_SESSION['mailcow_cc_role'] == 'domainadmin') {
+            // Domain admins cannot see, add or remove user ACLs they don't have access to by themselves
+            // Editing a user will use acl("get", "user") to determine granted ACLs and therefore block unallowed access escalation via form editing
+            $self_da_acl = acl('get', 'domainadmin', $_SESSION['mailcow_cc_username']);
+            foreach ($self_da_acl as $self_da_acl_key => $self_da_acl_val) {
+              if ($self_da_acl_val == 0) {
+                unset($data[$self_da_acl_key]);
+              }
+            }
+          }
           if (!empty($data)) {
             unset($data['username']);
             return $data;
@@ -182,6 +192,10 @@ function acl($_action, $_scope = null, $_data = null) {
         $acl_all = $stmt->fetchAll(PDO::FETCH_ASSOC);
         while ($row = array_shift($acl_all)) {
           $acl['acl'][$row['Field']] = 1;
+        }
+        // Read-only API keys must not log in as other accounts (SOGo SSO, dual login)
+        if (!empty($_SESSION['mailcow_cc_api']) && ($_SESSION['mailcow_cc_api_access'] ?? '') != 'rw') {
+          $acl['acl']['login_as'] = 0;
         }
       }
       elseif ($_SESSION['mailcow_cc_role'] == 'domainadmin' ||
